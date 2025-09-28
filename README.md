@@ -4,13 +4,14 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Releases](https://img.shields.io/badge/releases-v1.0-blue.svg)]()
 
-> POC: Parse Office/Windows `pkeyconfig` and related SKU/license metadata, present interactive HTML reports (searchable) and export to PDF, Excel, CSV, and more.  
-> Includes advanced inventory, encoding/decoding, and research‑only features — **disabled by default** and only for authorized research.
+> POC: Parse Office/Windows `pkeyconfig` and related SKU/license metadata and present interactive HTML reports (searchable) with export to PDF, Excel, CSV, and more.  
+> Uses advanced, low‑level techniques (including undocumented or platform‑internal APIs) to collect richer system metadata — **research‑only** and disabled by default.
 
 ---
 
 ## Table of contents
 - [About](#about)  
+- [Why low‑level/undocumented APIs?](#why-low-levelundocumented-apis)  
 - [Capabilities (feature list)](#capabilities-feature-list)  
 - [Primary goals](#primary-goals)  
 - [Quick start (POC)](#quick-start-poc)  
@@ -24,54 +25,52 @@
 ---
 
 ## About
-**PKeyInspector** is a Proof‑Of‑Concept tool for administrators, auditors, and authorized researchers that aggregates metadata from `pkeyconfig` files and other SKU/license sources and produces human‑friendly reports in HTML, PDF, Excel and CSV formats. The project provides rich search/export capabilities and multiple options for how results are presented and exported.
+**PKeyInspector** is a Proof‑Of‑Concept tool for administrators, auditors, and authorized researchers that aggregates metadata from `pkeyconfig` files, vendor XMLs, and system sources and produces human‑friendly reports (HTML, PDF, Excel, CSV). It also demonstrates the use of low‑level and undocumented platform internals to collect richer metadata when required.
 
-> This repository intentionally separates benign reporting features (openly enabled) from sensitive capabilities (research‑only, disabled by default). The maintainers will not assist or accept contributions that enable unauthorized license extraction, generation, or activation bypass.
+> Because low‑level and undocumented APIs can access internal structures and behavior that are not guaranteed stable or safe, those capabilities are explicitly **research‑only**, gated, and disabled by default.
+
+---
+
+## Why low‑level / undocumented APIs?
+High‑level documented APIs and registry queries are the safest route for typical inventory tasks, but they sometimes omit contextual metadata or vendor annotations. Low‑level techniques are included in this PoC to demonstrate:
+
+- how additional contextual metadata can be discovered in memory, binary structures, or policy blocks,
+- methods to recover richer SKU/product information when documented sources are unavailable,
+- research techniques for forensic analysis and vendor‑compatibility research.
+
+**Important:** Low‑level methods are brittle, platform‑version dependent, and may change or break with updates. They can also pose safety, privacy, and legal risks — see the Research‑only section and `SECURITY.md`.
 
 ---
 
 ## Capabilities (feature list)
-> The list below documents the full surface of capabilities envisioned for the project. Sensitive items are indicated and are **disabled by default**.
+> Full feature surface. Sensitive features are flagged as research‑only and disabled by default.
 
-- Parse `pkeyconfig` files (Office/Windows) and extract SKU/product metadata (GUIDs, names, attributes, release info).
-- Generate interactive **HTML** reports with client‑side search, filters, paging and sortable columns.
-- Export inventory to **PDF**, **Excel (.xlsx)**, **CSV**, and other common data formats.
-- Present consolidated lists of the *latest products + associated key metadata* from local files and vendor XML data sources.
-- Show keys as either **Genuine** (when verifiable by documented metadata) or **Generated** (when using selected generation options) — see Research‑only section.
-- Provide encoding options:
-  - Encode using API by SKU or GUID (safe, documented APIs only).
-  - Encode by selected *pattern* (research‑only; pattern library driven).
-  - Bulk encode from an internal reference list (2000+ entries).
-- Provide decoding options:
-  - Decode using KeyInfo-like structures and safe parsing utilities.
-  - Option to decode data discovered in a `folder` of files (read‑only parse).
+- Parse `pkeyconfig` XML files (Office/Windows) and extract SKU/product metadata.
+- Interactive **HTML** reports with client‑side search/filter, paging, and sorting.
+- Export to **PDF**, **Excel (.xlsx)**, **CSV**, and other formats.
+- Consolidate latest product + key metadata from local files and vendor datasets.
+- Present keys as **Genuine** or **Generated** (generated keys via pattern/encoding modules are research‑only).
+- Encoding options:
+  - Encode using documented APIs by SKU/GUID (where supported).
+  - Encode by selected **pattern** or bulk encode via internal reference list (2000+ entries) — research‑only where it involves undocumented behavior.
+- Decoding options:
+  - Decode KeyInfo-like structures; parse binary payloads in read‑only mode.
+  - Folder scanning and batch decode (read‑only, non‑destructive).
 - Extraction options (RESEARCH‑ONLY / GATED):
-  - Extract candidate key metadata embedded in local binaries (`.exe`, `.dll`) and present extracted artifacts in the report — **disabled by default**.
-  - Parse registry data blocks that may contain licensing metadata (two-block structures and kernel policy blocks) — **disabled by default**.
+  - Candidate extraction from binaries (`.exe`, `.dll`) and other artifacts (disabled by default).
+  - Parse registry data blocks including kernel policy blocks for license metadata (disabled by default).
 - System information collector:
-  - Gather OS Major/Minor/Build/UBR and `EditionID` using documented system calls where possible.
-  - Research option: collect the same data using low‑level reads (memory offsets) — **disabled by default**.
-- Error mapping & diagnostics:
-  - Extract and present error messages via documented APIs when available.
-  - Support error lists/mappings for: `CBS`, `BITS`, `HTTP`, `UPDATE`, `NETWORK`, `WIN32`, `NTSTATUS`, `ACTIVATION` (best‑effort and documented).
-- Activation/License operations (RESEARCH‑ONLY / GATED):
-  - Integration option with external libraries (e.g., `tsforge`) for authorized activation flows for lab/test purposes — **disabled by default**.
-  - Auto‑select activation method logic (KMS4K / ZeroCID / AVMA4K / HWID / KMS38) — listed as research/test-only integrations. The project will **not** provide instructions to use these against unauthorized systems.
-  - Manage license entries via documented APIs (e.g., `slc.dll` wrappers) in read/write modes — **research‑only and gated**.
-- Update matrix generation:
-  - Build an update matrix table for any version based on XML data extraction — independent of local API availability — useful for offline or unsupported versions.
-- View active license & settings:
-  - Report on current OEM defaults, the active SKU, and other system license metadata (read‑only where possible).
+  - Collect OS Major/Minor/Build/UBR/EditionID via documented APIs.
+  - Research-only collectors use low‑level reads of memory/offsets to recover additional context (disabled by default).
+- Error mapping & diagnostics: support for CBS, BITS, HTTP, UPDATE, NETWORK, WIN32, NTSTATUS, ACTIVATION code sets (best‑effort).
+- Update matrix: build update compatibility tables from XML datasets, including unsupported versions (offline).
+- Active license & settings view (OEM defaults, active SKU, and related metadata).
+- Activation/license management (RESEARCH‑ONLY / GATED): integration points for lab/test workflows (disabled by default).
 
 ---
 
 ## Primary goals
 - Provide a single, searchable inventory of SKU/product metadata from `pkeyconfig` and vendor datasets.  
-- Produce audit‑ready reports in HTML/PDF/Excel/CSV for compliance and documentation.  
-- Provide safe, easy‑to-review POC scripts and examples that reproduce parsing and export flows without privileged operations.  
-- Offer gated research features for authorized lab work; such features include additional warnings, logging, and explicit authorization steps.
-
----
-
-## Quick start (POC)
-> Non‑actionable, read‑only examples. See `/examples` for runnable POC scripts that are safe and mocked for sensitive functionality.
+- Produce audit‑ready reports in multiple export formats.  
+- Demonstrate how additional metadata can be surfaced using advanced low‑level techniques for authorized research and forensic analysis.  
+- Keep sensitive features gated, logged, and restricted to lab environments.
