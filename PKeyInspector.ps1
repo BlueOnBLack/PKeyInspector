@@ -2472,6 +2472,22 @@ function Free-IntPtr {
         return
     }
 
+    try {
+        $Module = [AppDomain]::CurrentDomain.GetAssemblies()| ? { $_.ManifestModule.ScopeName -eq "WIN32U" } | select -Last 1
+        $WIN32U = $Module.GetTypes()[0]
+    }
+    catch {
+        $Module = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("WIN32U", $False).DefineType("null")
+        @(
+            @('null', 'null', [int], @()), # place holder
+            @('NtUserCloseDesktop',       'win32U.dll', [Int], @([IntPtr])),
+            @('NtUserCloseWindowStation', 'win32U.dll', [Int], @([IntPtr]))
+        ) | % {
+            $Module.DefinePInvokeMethod(($_[0]), ($_[1]), 22, 1, [Type]($_[2]), [Type[]]($_[3]), 1, 3).SetImplementationFlags(128) # Def` 128, fail-safe 0 
+        }
+        $WIN32U = $Module.CreateType()
+    }
+
     [IntPtr]$ptrToFree = $handle
     #Write-Warning "Free $handle -> $Method"
 
@@ -2508,10 +2524,10 @@ function Free-IntPtr {
             $null = Free-Variant -variantPtr $ptrToFree
         }
         "Desktop" {
-            $null = Invoke-UnmanagedMethod -Dll win32U -Function NtUserCloseDesktop -Values @($ptrToFree) -SysCall
+            $null = $WIN32U::NtUserCloseDesktop($ptrToFree)
         }
         "WindowStation" {
-            $null = Invoke-UnmanagedMethod -Dll win32U -Function NtUserCloseWindowStation -Values @($ptrToFree) -SysCall
+            $null = $WIN32U::NtUserCloseWindowStation($ptrToFree)
         }
 
         <#
@@ -5251,49 +5267,44 @@ static void Main(string[] args)
 Clear-Host
 
 Write-Host
-write-host 'NtGetNextProcess Test'
 $hProc = [IntPtr]::Zero
 $hProcNext = [IntPtr]::Zero
-Invoke-UnmanagedMethod `
+$ret = Invoke-UnmanagedMethod `
     -Dll NTDLL `
     -Function ZwGetNextProcess `
     -Values @($hProc, [UInt32]0x02000000, [UInt32]0x00, [UInt32]0x00, ([ref]$hProcNext)) `
-    -SysCall
-$hProcNext
+    -Mode Allocate -SysCall
+write-host "NtGetNextProcess Test: $ret"
+write-host "hProcNext Value :$hProcNext"
 
 Write-Host
-write-host 'NtGetNextThread Test'
 $hThread = [IntPtr]::Zero
 $hThreadNext = [IntPtr]::Zero
-Invoke-UnmanagedMethod `
+$ret = Invoke-UnmanagedMethod `
     -Dll NTDLL `
     -Function ZwGetNextThread `
     -Values @([IntPtr]::new(-1), $hThread, 0x0040, 0x00, 0x00, ([ref]$hThreadNext)) `
-    -SysCall
-$hThreadNext
+    -Mode Protect -SysCall
+write-host "NtGetNextThread Test: $ret"
+write-host "hThreadNext Value :$hThreadNext"
 
 Write-Host
-write-host 'NtClose Test'
-Invoke-UnmanagedMethod `
+$ret = Invoke-UnmanagedMethod `
     -Dll NTDLL `
     -Function NtClose `
     -Values @([IntPtr]$hProcNext) `
-    -SysCall
+    -Mode Allocate -SysCall
+write-host "NtClose Test: $ret"
 
 Write-Host
-write-host 'NtCreateFile Test'
-
 $FileHandle = [IntPtr]::Zero
 $IoStatusBlock    = New-IntPtr -Size 16
 $ObjectAttributes = New-IntPtr -Size 48 -WriteSizeAtZero
-
 $filePath = ("\??\{0}\test.txt" -f [Environment]::GetFolderPath('Desktop'))
 $ObjectName = Init-NativeString -Encoding Unicode -Value $filePath
 [Marshal]::WriteIntPtr($ObjectAttributes, 0x10, $ObjectName)
 [Marshal]::WriteInt32($ObjectAttributes,  0x18, 0x40)
-
-# Call syscall
-Invoke-UnmanagedMethod `
+$ret = Invoke-UnmanagedMethod `
     -Dll NTDLL `
     -Function NtCreateFile `
     -Values @(
@@ -5309,9 +5320,9 @@ Invoke-UnmanagedMethod `
         [IntPtr]::Zero,       # EaBuffer
         0x00                  # EaLength
     ) `
-    -SysCall
-
+    -Mode Protect -SysCall
 Free-NativeString -StringPtr $ObjectName
+write-host "NtCreateFile Test: $ret"
 
 #>
 function Build-ApiDelegate {
@@ -5436,6 +5447,9 @@ function Initialize-ApiObject {
         [Parameter(Mandatory=$true, ValueFromPipeline)]
         [PSCustomObject]$ApiSpec,
 
+        [Parameter(Mandatory = $false)]
+        [string]$Mode = '',
+
         [Parameter(Mandatory=$false, ValueFromPipeline)]
         [switch]$SysCall
     )
@@ -5499,30 +5513,53 @@ function Initialize-ApiObject {
         }
         Free-IntPtr $SysCallPtr
         
-        $shellcode = if ([IntPtr]::Size -gt 4) { 
-            [TEB]::GenerateSyscallx64(
-                ([BitConverter]::GetBytes($sysCallID)))
+        [byte[]]$shellcode = if ([IntPtr]::Size -gt 4) { 
+            [byte[]]([TEB]::GenerateSyscallx64(
+                ([BitConverter]::GetBytes($sysCallID))))
         } else {
-            [TEB]::GenerateSyscallx86($funcAddress)
+            [byte[]]([TEB]::GenerateSyscallx86($funcAddress))
         }
+
+        $lpflOldProtect = [Uint32]0;
         $baseAddress = [IntPtr]::Zero;
+        $baseAddressPtr = [IntPtr]::Zero;
         $regionSize = [UIntPtr]::new($shellcode.Length);
 
-        if ([TEB]::ZwAllocateVirtualMemory(
-            [IntPtr]::new(-1),
-            [ref] $baseAddress,
-            [UIntPtr]::new(0x00),
-            [ref] $regionSize,
-            0x3000, 
-            0x40 
-        ) -ne 0) {
-            throw "Fail to allocate Memory for SysCall"
-        }
+        if ($Mode -eq 'Protect') {
+            $baseAddress = [gchandle]::Alloc($shellcode, 'pinned')
+            $baseAddressPtr = $baseAddress.AddrOfPinnedObject()
+            [IntPtr]$tempBase = $baseAddressPtr
 
-        [Marshal]::Copy(
-            $shellcode, 0, $baseAddress, $shellcode.Length)
-        $delegate = [Marshal]::GetDelegateForFunctionPointer(
-            $baseAddress, $delegateType)
+            if ([TEB]::NtProtectVirtualMemory(
+                    [IntPtr]::new(-1),
+                    [ref]$tempBase,
+                    ([ref]$regionSize),
+                    0x00000040,
+                    [ref]$lpflOldProtect) -ne 0) {
+                throw "Fail to Protect Memory for SysCall"
+            }
+
+            $delegate = [Marshal]::GetDelegateForFunctionPointer(
+                $baseAddressPtr, $delegateType)
+        }
+        elseif ($Mode -eq 'Allocate') {
+            if ([TEB]::ZwAllocateVirtualMemory(
+                [IntPtr]::new(-1),
+                [ref] $baseAddress,
+                [UIntPtr]::new(0x00),
+                [ref] $regionSize,
+                0x3000, 
+                0x40 
+            ) -ne 0) {
+                throw "Fail to allocate Memory for SysCall"
+            }
+
+            [Marshal]::Copy(
+                $shellcode, 0, $baseAddress, $shellcode.Length)
+
+            $delegate = [Marshal]::GetDelegateForFunctionPointer(
+                $baseAddress, $delegateType)
+        }
     }
     else {
         $delegate = [Marshal]::GetDelegateForFunctionPointer(
@@ -5536,7 +5573,8 @@ function Initialize-ApiObject {
         DelegateInstance = $delegate
         DelegateType     = $delegateType
         DelegateCode     = $delegateCode
-        BaseAddress      = $baseAddress
+        baseAddress      = $baseAddress
+        baseAddressPtr   = $baseAddressPtr
         RegionSize       = $regionSize 
     }
 }
@@ -5549,22 +5587,28 @@ function Release-ApiObject {
 
     process {
         try {
-            if ($ApiObject.BaseAddress -and $ApiObject.BaseAddress -ne [IntPtr]::Zero) {
-                $baseAddressToFree = $ApiObject.BaseAddress
-                [TEB]::ZwFreeVirtualMemory(
+            if ($ApiObject.baseAddressPtr -and $ApiObject.baseAddressPtr -ne [IntPtr]::Zero) {
+                $null = $ApiObject.baseAddress.Free()
+            }
+            elseif ($ApiObject.BaseAddress -and $ApiObject.BaseAddress -ne [IntPtr]::Zero) {
+                [IntPtr]$baseAddrLocal = $ApiObject.BaseAddress
+                [UIntPtr]$regionSizeLocal = $ApiObject.RegionSize
+
+                $null = [TEB]::ZwFreeVirtualMemory(
                     [IntPtr]::new(-1),
-                    [ref]($ApiObject.BaseAddress),
-                    [ref]($ApiObject.RegionSize),
-                    0x8000 ## MEM_RELEASE
+                    [ref]$baseAddrLocal, 
+                    [ref]$regionSizeLocal,
+                    0x8000
                 );
             }
-            $ApiObject.DelegateInstance = $null
-            $ApiObject.DelegateType = $null
-            $ApiObject.FunctionPtr = [IntPtr]::Zero
-            $ApiObject.DelegateCode = $null
             $ApiObject.Dll = $null
             $ApiObject.Function = $null
             $ApiObject.BaseAddress = $null
+            $ApiObject.baseAddressPtr = $null
+            $ApiObject.DelegateType = $null
+            $ApiObject.DelegateCode = $null
+            $ApiObject.DelegateInstance = $null
+            $ApiObject.FunctionPtr = 0x0
             [GC]::Collect()
             [GC]::WaitForPendingFinalizers()
 
@@ -5660,6 +5704,11 @@ function Invoke-UnmanagedMethod {
         [string]$CharSet = "Unicode",
 
         [Parameter(Mandatory = $false, Position = 8)]
+        [ValidateNotNullOrEmpty()]
+        [ValidateSet('Allocate', 'Protect')]
+        [string]$Mode = 'Allocate',
+
+        [Parameter(Mandatory = $false, Position = 9)]
         [switch]$SysCall
     )
 
@@ -5722,7 +5771,7 @@ function Invoke-UnmanagedMethod {
         -CharSet $CharSet
 
     $apiObj = if ($SysCall) {
-        Initialize-ApiObject -ApiSpec $apiSpec -SysCall
+        Initialize-ApiObject -ApiSpec $apiSpec -Mode $Mode -SysCall
     }
     else {
         $apiSpec | Initialize-ApiObject
@@ -10073,6 +10122,24 @@ Function Obtain-UserToken {
         [switch] $loadProfile
     )
 
+    try {
+        $Module = [AppDomain]::CurrentDomain.GetAssemblies()| ? { $_.ManifestModule.ScopeName -eq "USER" } | select -Last 1
+        $USER = $Module.GetTypes()[0]
+    }
+    catch {
+        $Module = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("USER", $False).DefineType("null")
+        @(
+            @('null', 'null', [int], @()), # place holder
+            @('NtDuplicateToken', 'ntdll.dll',   [int32], @([IntPtr], [Int], [IntPtr], [Int], [Int], [IntPtr].MakeByRefType())),
+            @('LoadUserProfileW', 'Userenv.dll', [bool],  @([IntPtr], [IntPtr])),
+            @('LogonUserExExW',   'sspicli.dll', [bool],  @([IntPtr], [IntPtr], [IntPtr], [Int], [Int], [IntPtr], [IntPtr].MakeByRefType(), [IntPtr], [IntPtr], [IntPtr], [IntPtr]))
+        ) | % {
+            $Module.DefinePInvokeMethod(($_[0]), ($_[1]), 22, 1, [Type]($_[2]), [Type[]]($_[3]), 1, 3).SetImplementationFlags(128) # Def` 128, fail-safe 0 
+        }
+        $USER = $Module.CreateType()
+    }
+
+
     $phToken = [IntPtr]::Zero
     $UserNamePtr = [Marshal]::StringToHGlobalUni($UserName)
     $PasswordPtr = if ([string]::IsNullOrEmpty($Password)) { [IntPtr]::Zero } else { [Marshal]::StringToHGlobalUni($Password) }
@@ -10089,7 +10156,20 @@ Function Obtain-UserToken {
           specified by the lpApplicationName or the lpCommandLine parameter.
         #>
 
-        $ret = Invoke-UnmanagedMethod `
+        <#
+        # Work, but actualy fail, so, no thank you
+        if (!($USER::LogonUserExExW(
+            $UserNamePtr, $DomainPtr, $PasswordPtr,
+            0x02, # 0x02, 0x03, 0x07, 0x08
+            0x00, # LOGON32_PROVIDER_DEFAULT
+            [IntPtr]0, ([ref]$phToken), [IntPtr]0,
+            [IntPtr]0, [IntPtr]0, [IntPtr]0))) {
+                throw "LogonUserExExW Failure .!"
+            }
+        #>
+
+        #<#
+        if (!(Invoke-UnmanagedMethod `
             -Dll sspicli `
             -Function LogonUserExExW `
             -CallingConvention StdCall `
@@ -10100,35 +10180,28 @@ Function Obtain-UserToken {
                 0x02, # 0x02, 0x03, 0x07, 0x08
                 0x00, # LOGON32_PROVIDER_DEFAULT
                 [IntPtr]0, ([ref]$phToken), [IntPtr]0,
-                [IntPtr]0, [IntPtr]0, [IntPtr]0
-            )
+                [IntPtr]0, [IntPtr]0, [IntPtr]0))) {
+                    throw "LogonUserExExW Failure .!"
+                }
+        #>
 
         # according to MS article, this is primary Token
         # we can return this --> $phToken, Directly.!
         # return $phToken
 
         #<#
-        if (!$ret) {
-            throw "Failed to Call LogonUserExExW."
-        }
 
         # Duplicate token to Primary
         $hToken = [IntPtr]0
-        $ret = Invoke-UnmanagedMethod `
-            -Dll NTDLL `
-            -Function NtDuplicateToken `
-            -CallingConvention StdCall `
-            -CharSet Unicode `
-            -Return int32 `
-            -Values @(
+        
+        $ret = $USER::NtDuplicateToken(
                 $phToken,        # Existing token
                 0xF01FF,         # DesiredAccess: all rights needed
                 [IntPtr]0,       # ObjectAttributes
                 0x02,            # SECURITY_IMPERSONATION
                 0x01,            # TOKEN_PRIMARY
                 ([ref]$hToken)   # New token handle
-            ) `
-            -SysCall
+            )
 
         if ($ret -ne 0) {
             Free-IntPtr -handle $hToken -Method NtHandle
@@ -10143,12 +10216,7 @@ Function Obtain-UserToken {
         $lpProfileInfo = New-IntPtr -Size $dwSize -WriteSizeAtZero
         $lpUserName = [Marshal]::StringToCoTaskMemUni($UserName)
         [Marshal]::WriteIntPtr($lpProfileInfo, 0x08, $lpUserName)
-        if (!(Invoke-UnmanagedMethod `
-            -Dll Userenv.dll `
-            -Function LoadUserProfileW `
-            -Return bool `
-            -CharSet Unicode `
-            -Values @($hToken, $lpProfileInfo))) {
+        if (!($USER::LoadUserProfileW($hToken, $lpProfileInfo))) {
                 throw "Failed to Load User profile."
             }
 
@@ -10166,6 +10234,27 @@ Function Process-UserToken {
         [PSObject]$Params = $null,
         [IntPtr]$hToken = [IntPtr]0
     )
+
+    try {
+        $Module = [AppDomain]::CurrentDomain.GetAssemblies()| ? { $_.ManifestModule.ScopeName -eq "Token" } | select -Last 1
+        $Token = $Module.GetTypes()[0]
+    }
+    catch {
+        $Module = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("Token", $False).DefineType("null")
+        @(
+            @('null', 'null', [int], @()), # place holder
+            @('OpenWindowStationW',           'User32.dll',   [intptr], @([string], [Int], [Int])),
+            @('GetProcessWindowStation',      'User32.dll',   [intptr], @()),
+            @('SetProcessWindowStation',      'User32.dll',   [bool],   @([IntPtr])),
+            @('OpenDesktopW',                 'User32.dll',   [intptr], @([string], [int], [int], [int])),
+            @('SetTokenInformation',          'advapi32.dll', [bool],   @([IntPtr], [Int], [IntPtr], [Int])),
+            @('WTSGetActiveConsoleSessionId', 'Kernel32.dll', [int],    @())
+        ) | % {
+            $Module.DefinePInvokeMethod(($_[0]), ($_[1]), 22, 1, [Type]($_[2]), [Type[]]($_[3]), 1, 3).SetImplementationFlags(128) # Def` 128, fail-safe 0 
+        }
+        $Token = $Module.CreateType()
+    }
+
     if ($Params -ne $null) {
         Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hWinSta, $Params.LogonSid) | Out-Null
         Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hDesktop, $Params.LogonSid) | Out-Null
@@ -10178,20 +10267,17 @@ Function Process-UserToken {
     elseif ($hToken -ne [IntPtr]::Zero) {
         $hDesktop, $hWinSta = [IntPtr]0, [IntPtr]0
         $activeSessionIdPtr, $LogonSid = [IntPtr]0, [IntPtr]0
-        $hWinSta = Invoke-UnmanagedMethod -Dll User32 -Function OpenWindowStationW -Return intptr -Values @(
-            "winsta0", 0x00, (0x00020000 -bor 0x00040000L))
+        $hWinSta = $Token::OpenWindowStationW("winsta0", 0x00, (0x00020000 -bor 0x00040000L))
         if ($hWinSta -eq [IntPtr]::Zero) {
             throw "OpenWindowStationW failed .!"
         }
 
-        $WinstaOld = Invoke-UnmanagedMethod -Dll User32 -Function GetProcessWindowStation -Return intptr
-        if (!(Invoke-UnmanagedMethod -Dll User32 -Function SetProcessWindowStation -Return bool -Values @($hWinSta))) {
+        $WinstaOld = $Token::GetProcessWindowStation()
+        if (!($Token::SetProcessWindowStation($hWinSta))) {
             throw "SetProcessWindowStation failed .!"
         }
-        $hDesktop = Invoke-UnmanagedMethod -Dll User32 -Function OpenDesktopW -Values @(
-            "default", 0x00, 0x00, (0x00020000 -bor 0x00040000 -bor 0x0080 -bor 0x0001))
-
-        Invoke-UnmanagedMethod -Dll User32 -Function SetProcessWindowStation -Return bool -Values @($WinstaOld) | Out-Null
+        $hDesktop = $Token::OpenDesktopW("default", 0x00, 0x00, (0x00020000 -bor 0x00040000 -bor 0x0080 -bor 0x0001))
+        $Token::SetProcessWindowStation($WinstaOld) | Out-Null
 
         ## Call helper DLL
         if (!(Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function GetLogonSidFromToken -Return bool -Values @($hToken, ([ref]$LogonSid)))) {
@@ -10210,7 +10296,7 @@ Function Process-UserToken {
         
         ## any other case will fail
         if (Check-AccountType -AccType System) {
-            $activeSessionId = Invoke-UnmanagedMethod -Dll Kernel32 -Function WTSGetActiveConsoleSessionId -Return intptr
+            $activeSessionId = $Token::WTSGetActiveConsoleSessionId()
             $activeSessionIdPtr = New-IntPtr -Size 4 -InitialValue $activeSessionId
             if (!(Invoke-UnmanagedMethod -Dll ADVAPI32 -Function SetTokenInformation -Return bool -Values @(
                 $hToken, 0xc, $activeSessionIdPtr, 4
