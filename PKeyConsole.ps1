@@ -5150,114 +5150,6 @@ https://jhalon.github.io/utilizing-syscalls-in-csharp-2/
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-[DllImport("kernel32.dll", CharSet=CharSet.Unicode)]
-[DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
-public static extern IntPtr LoadLibraryW(string lpLibFileName);
-
-[DllImport("kernel32.dll")]
-[DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
-public static extern IntPtr GetProcAddress(
-    IntPtr hModule,
-    string lpProcName);
-
-[DllImport("ntdll.dll", SetLastError = true)]
-public static extern int NtProtectVirtualMemory(
-    IntPtr ProcessHandle,           // Handle to the process
-    ref IntPtr BaseAddress,         // Base address of the memory region
-    ref UIntPtr RegionSize,         // Size of the region to protect
-    uint NewProtection,             // New protection (e.g., PAGE_EXECUTE_READWRITE)
-    out uint OldProtection          // Old protection (output)
-);
-
-public static byte[] GenerateSyscall (byte[] syscall)
-{
-    return  new byte[]
-    {
-        0x4C, 0x8B, 0xD1,                                       // mov r10, rcx
-        0xB8, syscall[0], syscall[1], syscall[2], syscall[3],   // mov eax, syscall
-        0x0F, 0x05,                                             // syscall
-        0xC3                                                    // ret
-    };
-}
-
-[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-public delegate int NtGetNextProcessDelegate(
-    IntPtr ProcessHandle,       // HANDLE
-    uint DesiredAccess,         // ACCESS_MASK
-    uint HandleAttributes,      // ULONG
-    uint Flags,                 // ULONG
-    ref IntPtr NewProcessHandle // PHANDLE (output)
-);
-
-static void Main(string[] args)
-{
-    byte[] shellcode = null;
-    uint syscallNumber = 0;
-    IntPtr processHandle = IntPtr.Zero;
-    IntPtr newProcessHandle = IntPtr.Zero;
-
-    var Address = GetProcAddress(LoadLibraryW("ntdll.dll"), "NtGetNextProcess");
-    if (Address != IntPtr.Zero)
-    {
-        unsafe
-        {
-            // Cast the IntPtr to a byte pointer
-            byte* pFunc = (byte*)Address;
-
-            // Read the first few bytes. 
-            // This is the common syscall stub for 64-bit Windows.
-            byte byte1 = pFunc[0]; // should be 0x4C
-            byte byte2 = pFunc[1]; // should be 0x8B
-            byte byte3 = pFunc[2]; // should be 0xD1
-            byte byte4 = pFunc[3]; // should be 0xB8
-
-            // The syscall number is in the next 4 bytes
-            syscallNumber = *(uint*)(pFunc + 4);
-        }
-    }
-
-    if (syscallNumber == 0)
-    {
-        return;
-    }
-
-    var syscallBytes = BitConverter.GetBytes(syscallNumber);
-    shellcode  = GenerateSyscall(syscallBytes);
-
-    unsafe
-    {
-        fixed (byte* ptr = shellcode)
-        {
-            // Store the original address of the shellcode
-            uint lpflOldProtect = 0;
-            var hProc = new IntPtr(-1);
-            var originalBaseAddress = (IntPtr)ptr;
-            var tempBaseAddress = originalBaseAddress;
-            var tempLength = new UIntPtr((uint)shellcode.Length);
-
-            // Call NtProtectVirtualMemory with the temporary variables
-            if (NtProtectVirtualMemory(hProc, ref tempBaseAddress, ref tempLength, (uint)0x00000040, out lpflOldProtect) != 0)
-            {
-                throw new Win32Exception();
-            }
-
-            // Use the ORIGINAL address to create the delegate
-            var ntGetNextProcessDel = Marshal.GetDelegateForFunctionPointer<NtGetNextProcessDelegate>(originalBaseAddress);
-
-            // Example of calling the dynamic assembly via delegate
-            processHandle = IntPtr.Zero; 
-            newProcessHandle = IntPtr.Zero;
-            while (0 == ntGetNextProcessDel(processHandle, 0x02000000, 0x00, 0x00, ref newProcessHandle))
-            {
-                Console.WriteLine($"NtGetNextProcess succeeded, NewProcessHandle: {newProcessHandle}");
-                processHandle = newProcessHandle;
-            }
-        }
-    }
-}
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Clear-Host
 
 Write-Host
@@ -5278,7 +5170,7 @@ $ret = Invoke-UnmanagedMethod `
     -Dll NTDLL `
     -Function ZwGetNextThread `
     -Values @([IntPtr]::new(-1), $hThread, 0x0040, 0x00, 0x00, ([ref]$hThreadNext)) `
-    -Mode Protect -SysCall
+    -Mode AllocateEx -SysCall
 write-host "NtGetNextThread Test: $ret"
 write-host "hThreadNext Value :$hThreadNext"
 
@@ -5317,7 +5209,6 @@ $ret = Invoke-UnmanagedMethod `
     -Mode Protect -SysCall
 Free-NativeString -StringPtr $ObjectName
 write-host "NtCreateFile Test: $ret"
-
 #>
 function Build-ApiDelegate {
     param (
@@ -5520,9 +5411,9 @@ function Initialize-ApiObject {
         $regionSize = [UIntPtr]::new($shellcode.Length);
 
         if ($Mode -eq 'Protect') {
-            $baseAddress = [gchandle]::Alloc($shellcode, 'pinned')
-            $baseAddressPtr = $baseAddress.AddrOfPinnedObject()
-            [IntPtr]$tempBase = $baseAddressPtr
+            $baseAddressPtr = [gchandle]::Alloc($shellcode, 'pinned')
+            $baseAddress = $baseAddressPtr.AddrOfPinnedObject()
+            [IntPtr]$tempBase = $baseAddress
 
             if ([TEB]::NtProtectVirtualMemory(
                     [IntPtr]::new(-1),
@@ -5532,28 +5423,36 @@ function Initialize-ApiObject {
                     [ref]$lpflOldProtect) -ne 0) {
                 throw "Fail to Protect Memory for SysCall"
             }
-
-            $delegate = [Marshal]::GetDelegateForFunctionPointer(
-                $baseAddressPtr, $delegateType)
         }
-        elseif ($Mode -eq 'Allocate') {
-            if ([TEB]::ZwAllocateVirtualMemory(
-                [IntPtr]::new(-1),
-                [ref] $baseAddress,
-                [UIntPtr]::new(0x00),
-                [ref] $regionSize,
-                0x3000, 
-                0x40 
-            ) -ne 0) {
+        elseif ($Mode -match "Allocate|AllocateEx") {
+            $ret = if ($Mode -eq 'Allocate') {
+                [TEB]::ZwAllocateVirtualMemory(
+                    [IntPtr]::new(-1),
+                    [ref] $baseAddress,
+                    [UIntPtr]::new(0x00),
+                    [ref] $regionSize,
+                    0x3000, 
+                    0x40 
+                )
+            } elseif ($Mode -eq 'AllocateEx') {
+                [TEB]::ZwAllocateVirtualMemoryEx(
+                   [IntPtr]::new(-1),
+                   [ref]$baseAddress,
+                   [ref]$regionSize,
+                   0x3000, 0x40,
+                   [IntPtr]0,0)
+            }
+
+            if ($ret -ne 0) {
                 throw "Fail to allocate Memory for SysCall"
             }
 
             [Marshal]::Copy(
                 $shellcode, 0, $baseAddress, $shellcode.Length)
-
-            $delegate = [Marshal]::GetDelegateForFunctionPointer(
-                $baseAddress, $delegateType)
         }
+
+        $delegate = [Marshal]::GetDelegateForFunctionPointer(
+            $baseAddress, $delegateType)
     }
     else {
         $delegate = [Marshal]::GetDelegateForFunctionPointer(
@@ -5569,7 +5468,7 @@ function Initialize-ApiObject {
         DelegateCode     = $delegateCode
         baseAddress      = $baseAddress
         baseAddressPtr   = $baseAddressPtr
-        RegionSize       = $regionSize 
+        RegionSize       = $regionSize
     }
 }
 function Release-ApiObject {
@@ -5582,7 +5481,7 @@ function Release-ApiObject {
     process {
         try {
             if ($ApiObject.baseAddressPtr -and $ApiObject.baseAddressPtr -ne [IntPtr]::Zero) {
-                $null = $ApiObject.baseAddress.Free()
+                $null = $ApiObject.baseAddressPtr.Free()
             }
             elseif ($ApiObject.BaseAddress -and $ApiObject.BaseAddress -ne [IntPtr]::Zero) {
                 [IntPtr]$baseAddrLocal = $ApiObject.BaseAddress
@@ -5699,7 +5598,7 @@ function Invoke-UnmanagedMethod {
 
         [Parameter(Mandatory = $false, Position = 8)]
         [ValidateNotNullOrEmpty()]
-        [ValidateSet('Allocate', 'Protect')]
+        [ValidateSet('Allocate', 'AllocateEx', 'Protect')]
         [string]$Mode = 'Allocate',
 
         [Parameter(Mandatory = $false, Position = 9)]
@@ -8971,6 +8870,17 @@ public static class TEB
 Add-Type -TypeDefinition $TEB -ErrorAction Stop
 }
 Function NtCurrentTeb {
+    
+    <#
+    Example Use
+    NtCurrentTeb -Mode Buffer -Method Base
+    NtCurrentTeb -Mode Buffer -Method Extend
+    NtCurrentTeb -Mode Buffer -Method Protect
+    NtCurrentTeb -Mode Remote -Method Base
+    NtCurrentTeb -Mode Remote -Method Extend
+    NtCurrentTeb -Mode Remote -Method Protect
+    #>
+
     param (
         # Mode options for retrieving the TEB address:
         # Return   -> value returned directly in CPU register
@@ -8984,7 +8894,7 @@ Function NtCurrentTeb {
 
         # Allocation method for virtual memory
         [Parameter(Mandatory = $false, Position = 2)]
-        [ValidateSet("Base", "Extend")]
+        [ValidateSet("Base", "Extend", "Protect")]
         [string]$Method = "Base",
 
         # Optional flags to select which fields to read from TEB/PEB
@@ -9154,12 +9064,21 @@ Function NtCurrentTeb {
 
     if ($Mode -eq 'Remote') {
         [TEB]::CallbackResult = 0
-        $callback = [Teb]::GetCallback();
-        $callbackPtr = [Marshal]::GetFunctionPointerForDelegate($callback);
+        if (!$Global:MyCallbackDelegate) {
+          $callbackDelegate = {
+            param([IntPtr] $delPtr, [IntPtr] $valPtr)
+            [TEB]::CallbackResult = $valPtr
+          }
+          $handle = [gchandle]::Alloc($callbackDelegate, [GCHandleType]::Normal)
+          $Global:MyCallbackDelegate = $callbackDelegate
+          #$Global:MyCallbackDelegate = [Teb]::GetCallback();
+        }
+        $callbackPtr = [Marshal]::GetFunctionPointerForDelegate(([TEB+CallbackDelegate]$Global:MyCallbackDelegate));
 
+        [byte[]]$shellcode = $null
         if ([IntPtr]::Size -eq 8)
         {
-            $shellcode = [byte[]]@(
+            [byte[]]$shellcode = [byte[]]@(
                 0x48, 0x89, 0xC8,                  ## mov rax, rcx      ## Move function address (first param) to rax.
                 0x65, 0x48, 0x8B, 0x14, 0x25, 0x30, 0x00, 0x00, 0x00,   ## mov rdx, gs:[0x30]
                                                                         ## Set second param (rdx) from a known memory location.
@@ -9171,7 +9090,7 @@ Function NtCurrentTeb {
         }
         elseif ([IntPtr]::Size -eq 4)
         {
-            $shellcode = [byte[]]@(
+            [byte[]]$shellcode = [byte[]]@(
                 0x64, 0xA1, 0x18, 0x00, 0x00, 0x00, ## mov eax, fs:[0x18] ## Get a specific address from the Thread Information Block.
                 0x50,                               ## push eax           ## Push this address onto the stack to use later.
                 0x8B, 0x44, 0x24, 0x08,             ## mov eax, [esp + 8] ## Get a second value (a function pointer or argument) from the stack.
@@ -9181,24 +9100,56 @@ Function NtCurrentTeb {
                 0xC3                                ## ret                ## Return to the calling code.
             )
         }
-        $baseAddress = [IntPtr]::Zero;
-        $regionSize = [UIntPtr]::new($shellcode.Length);
-        $status = [TEB]::ZwAllocateVirtualMemory(
-            [IntPtr]::new(-1),
-            [ref] $baseAddress,
-            [UIntPtr]::new(0x00),
-            [ref] $regionSize,
-            0x3000,   ## MEM_COMMIT | MEM_RESERVE
-            0x40      ## PAGE_EXECUTE_READWRITE
-        );
 
-        if ($status -ne 0)
-        {
-            return;
+        $baseAddressPtr = $null
+        $len = $shellcode.Length
+        $lpflOldProtect = [UInt32]0
+        $baseAddress = [IntPtr]::Zero
+        $regionSize = [uintptr]::new($len)
+    
+        if ($Method -match "Base|Extend") {
+        
+            ## Allocate
+            $ntStatus = if ($Method -eq "Base") {
+                [TEB]::ZwAllocateVirtualMemory(
+                   [IntPtr]::new(-1),
+                   [ref]$baseAddress,
+                   [UIntPtr]::new(0x00),
+                   [ref]$regionSize,
+                   0x3000, 0x40)
+            } elseif ($Method -eq "Extend") {
+                [TEB]::ZwAllocateVirtualMemoryEx(
+                   [IntPtr]::new(-1),
+                   [ref]$baseAddress,
+                   [ref]$regionSize,
+                   0x3000, 0x40,
+                   [IntPtr]0,0)
+            }
+
+            if ($ntStatus -ne 0) {
+                throw "ZwAllocateVirtualMemory failed with result: $ntStatus"
+            }
+
+            $Address = [IntPtr]::Zero
+            [marshal]::Copy($shellcode, 0x00, $baseAddress, $len)
+            ## Allocate
+
+        } else {
+        
+            ## Protect
+            $baseAddressPtr = [gchandle]::Alloc($shellcode, 'pinned')
+            $baseAddress = $baseAddressPtr.AddrOfPinnedObject()
+            [IntPtr]$tempBase = $baseAddress
+            if ([TEB]::NtProtectVirtualMemory(
+                    [IntPtr]::new(-1),
+                    [ref]$tempBase,
+                    ([ref]$regionSize),
+                    0x00000040,
+                    [ref]$lpflOldProtect) -ne 0) {
+                throw "Fail to Protect Memory for SysCall"
+            }
+            ## Protect
         }
-
-        ## Copy shellcode to allocated memory
-        [Marshal]::Copy($shellcode, 0, $baseAddress, $shellcode.Length);
 
         $handle = [IntPtr]::Zero
         try
@@ -9212,14 +9163,17 @@ Function NtCurrentTeb {
         {
             Start-Sleep -Milliseconds 400
             if ($handle.IsAllocated) { $handle.Free() }
-        }
 
-        $status = [TEB]::ZwFreeVirtualMemory(
-            [IntPtr]::new(-1),
-            [ref] $baseAddress,
-            [ref] $regionSize,
-            0x8000 ## MEM_RELEASE
-        );
+            if ($baseAddressPtr -ne $null) {
+                $baseAddressPtr.Free()
+            } else {
+                [TEB]::ZwFreeVirtualMemory(
+                    [IntPtr]::new(-1),
+                    [ref]$baseAddress,
+                    [ref]$regionSize,
+                    0x4000) | Out-Null
+            }
+        }
 
         if ($Log) {
             Write-Warning "Mode: Remote. TypeOf: Callback Delegate"
@@ -9257,36 +9211,58 @@ Function NtCurrentTeb {
         return [TEB]::CallbackResult
     }
     
-    $shellcode = Build-ASM-Shell
+    [byte[]]$shellcode = [byte[]](Build-ASM-Shell)
+    $baseAddressPtr = $null
     $len = $shellcode.Length
+    $lpflOldProtect = [UInt32]0
     $baseAddress = [IntPtr]::Zero
     $regionSize = [uintptr]::new($len)
     
-    $ntStatus = if ($Method -eq "Base") {
-        [TEB]::ZwAllocateVirtualMemory(
-           [IntPtr]::new(-1),
-           [ref]$baseAddress,
-           [UIntPtr]::new(0x00),
-           [ref]$regionSize,
-           0x3000, 0x40)
+    if ($Method -match "Base|Extend") {
+        
+        ## Allocate
+        $ntStatus = if ($Method -eq "Base") {
+            [TEB]::ZwAllocateVirtualMemory(
+               [IntPtr]::new(-1),
+               [ref]$baseAddress,
+               [UIntPtr]::new(0x00),
+               [ref]$regionSize,
+               0x3000, 0x40)
+        } elseif ($Method -eq "Extend") {
+            [TEB]::ZwAllocateVirtualMemoryEx(
+               [IntPtr]::new(-1),
+               [ref]$baseAddress,
+               [ref]$regionSize,
+               0x3000, 0x40,
+               [IntPtr]0,0)
+        }
+
+        if ($ntStatus -ne 0) {
+            throw "ZwAllocateVirtualMemory failed with result: $ntStatus"
+        }
+
+        $Address = [IntPtr]::Zero
+        [marshal]::Copy($shellcode, 0x00, $baseAddress, $len)
+        ## Allocate
+
     } else {
-        [TEB]::ZwAllocateVirtualMemoryEx(
-           [IntPtr]::new(-1),
-           [ref]$baseAddress,
-           [ref]$regionSize,
-           0x3000, 0x40,
-           [IntPtr]0,0)
-    }
-
-
-    if ($ntStatus -ne 0) {
-        throw "ZwAllocateVirtualMemory failed with result: $ntStatus"
+        
+        ## Protect
+        $baseAddressPtr = [gchandle]::Alloc($shellcode, 'pinned')
+        $baseAddress = $baseAddressPtr.AddrOfPinnedObject()
+        [IntPtr]$tempBase = $baseAddress
+        if ([TEB]::NtProtectVirtualMemory(
+                [IntPtr]::new(-1),
+                [ref]$tempBase,
+                ([ref]$regionSize),
+                0x00000040,
+                [ref]$lpflOldProtect) -ne 0) {
+            throw "Fail to Protect Memory for SysCall"
+        }
+        ## Protect
     }
 
     try {
-        $Address = [IntPtr]::Zero
-        [marshal]::Copy($shellcode, 0x00, $baseAddress, $len)
-
         switch ($Mode) {
           "Return" {
             if ($log) {
@@ -9326,11 +9302,15 @@ Function NtCurrentTeb {
         return $Address
     }
     finally {
-        [TEB]::ZwFreeVirtualMemory(
-            [IntPtr]::new(-1),
-            [ref]$baseAddress,
-            [ref]$regionSize,
-            0x4000) | Out-Null
+        if ($baseAddressPtr -ne $null) {
+            $baseAddressPtr.Free()
+        } else {
+            [TEB]::ZwFreeVirtualMemory(
+                [IntPtr]::new(-1),
+                [ref]$baseAddress,
+                [ref]$regionSize,
+                0x4000) | Out-Null
+        }
     }
 }
 
