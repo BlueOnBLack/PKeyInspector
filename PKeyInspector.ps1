@@ -10300,18 +10300,11 @@ Function Process-UserToken {
 }
 function Get-ProcessHandle {
     param (
-        [int] $ProcessId,
+        [int]    $ProcessId,
         [string] $ProcessName,
         [string] $ServiceName,
         [switch] $Impersonat
     )
-
-    # Constants
-    $SC_MANAGER_CONNECT        = 0x0001
-    $SC_MANAGER_CREATE_SERVICE = 0x0002
-    $SERVICE_QUERY_STATUS      = 0x0004
-    $SERVICE_START             = 0x0010
-    $SERVICE_QUERY_STATUS      = 0x0004
 
     $scManager = $tiService = [IntPtr]::Zero
     $buffer = $clientIdPtr = $attributesPtr = [IntPtr]::Zero
@@ -10332,14 +10325,8 @@ function Get-ProcessHandle {
             $attributesPtr = New-IntPtr -Size $objectAttrSize -WriteSizeAtZero
             $clientIdPtr   = New-IntPtr -Size $clientIdSize   -InitialValue $ProcID -UsePointerSize
             $ntStatus = $Global:ntdll::NtOpenProcess(
-                [ref]$handle, 0x1F0FFF, $attributesPtr, $clientIdPtr)
+                [ref]$handle, (0x0080 -bor 0x0800 -bor 0x0040 -bor 0x0400), $attributesPtr, $clientIdPtr)
 
-            if ($ntStatus -ne 0) {
-                Start-Sleep 1
-                write-warning "get handle using PROCESS_ALL_ACCESS failed, re-try with PROCESS_CREATE_PROCESS"
-                $ntStatus = $Global:ntdll::NtOpenProcess(
-                    [ref]$handle, (0x0080 -bor 0x0800 - 0x0040), $attributesPtr, $clientIdPtr)
-            }
             if (!$Impersonat) {
                 return $handle
             }
@@ -10373,6 +10360,7 @@ function Get-ProcessHandle {
             Free-IntPtr -handle $attributesPtr
         }
     }
+    
     try {
             if ($ProcessId -ne 0) {
                 if ($Impersonat) {
@@ -10396,17 +10384,15 @@ function Get-ProcessHandle {
 
             if (![string]::IsNullOrEmpty($ServiceName)) {
                 $ReturnLength = 0
-                $dwDesiredAccess = $SC_MANAGER_CONNECT -bor $SC_MANAGER_CREATE_SERVICE
-                $hSCManager = $Global:advapi32::OpenSCManagerW(0,0,$dwDesiredAccess)
+                $hSCManager = $Global:advapi32::OpenSCManagerW(0,0, (0x0001 -bor 0x0002))
 
                 if ($hSCManager -eq [IntPtr]::Zero) {
                     throw "OpenSCManagerW failed to open the service manger"
                 }
 
-                $dwDesiredAccess = $SERVICE_START -bor $SERVICE_QUERY_STATUS
                 $lpServiceName = [Marshal]::StringToHGlobalAuto($ServiceName)
                 $hService = $Global:advapi32::OpenServiceW(
-                    $hSCManager, $lpServiceName, $dwDesiredAccess)
+                    $hSCManager, $lpServiceName, 0x0004 -bor 0x0010)
 
                 if ($hService -eq [IntPtr]::Zero) {
                     throw "OpenServiceW failed"
@@ -10595,7 +10581,8 @@ Invoke-Process `
 Invoke-Process `
     -CommandLine "cmd /k whoami" `
     -ProcessName winlogon `
-    -RunAsConsole -UseDuplicatedToken
+    -RunAsConsole `
+    -UseDuplicatedToken
 
 # Could Fail to start from system/TI
 Write-Host 'Invoke-ProcessAsUser, As Logon' -ForegroundColor Green
@@ -10664,6 +10651,9 @@ Function Invoke-Process {
             if (!($RunAsParent -xor $UseDuplicatedToken)) {
                 throw "-ProcessName or -ServiceName Parameters, Must Run with -RunAsParent or -UseDuplicatedToken"
             }
+            if ($UseDuplicatedToken) {
+                Write-Warning "`nToken duplication may fail for highly privileged service processes (e.g., TrustedInstaller)`ndue to restrictive Access Control Lists (ACLs) or Protected Process status.`n"
+            }
         }
 
         $ret = Adjust-TokenPrivileges -Privilege SeDebugPrivilege -SysCall
@@ -10703,7 +10693,7 @@ Function Invoke-Process {
             $tHandle = Get-ProcessHelper `
                 -ProcessId $ProcessId `
                 -ProcessName $ProcessName `
-                -ServiceName $Service `
+                -ServiceName $ServiceName `
                 -Impersonat $false
 
             # Allocate unmanaged memory for the handle pointer
@@ -10730,7 +10720,7 @@ Function Invoke-Process {
             $tHandle = Get-ProcessHelper `
                 -ProcessId $ProcessId `
                 -ProcessName $ProcessName `
-                -ServiceName $Service `
+                -ServiceName $ServiceName `
                 -Impersonat $true
         }
         
