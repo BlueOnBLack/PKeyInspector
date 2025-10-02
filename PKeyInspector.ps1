@@ -2923,6 +2923,7 @@ Function Init-SLC {
 }
 Function Init-NTDLL {
 $functions = @(
+    @{ Name = "NtDuplicateToken";          Dll = "ntdll.dll"; ReturnType = [Int32];  Parameters = @([IntPtr], [Int], [IntPtr], [Int], [Int], [IntPtr].MakeByRefType())},
     @{ Name = "NtQuerySystemInformation";  Dll = "ntdll.dll"; ReturnType = [Int32];  Parameters = @([Int32],[IntPtr],[Int32],[Int32].MakeByRefType())},
     @{ Name = "CsrClientCallServer";       Dll = "ntdll.dll"; ReturnType = [Int32];  Parameters = @([IntPtr],[IntPtr],[Int32],[Int32])},
     @{ Name = "NtResumeThread";            Dll = "ntdll.dll"; ReturnType = [Int32];  Parameters = @([IntPtr],[Int32])},
@@ -3121,13 +3122,16 @@ Function Init-advapi32 {
         @{ Name = "OpenSCManagerW";          Dll = "advapi32.dll"; ReturnType = [IntPtr]; Parameters = [Type[]]@([Int32],[IntPtr],[Int32]) },
         @{ Name = "CloseServiceHandle";      Dll = "advapi32.dll"; ReturnType = [BOOL];   Parameters = [Type[]]@([IntPtr]) },
         @{ Name = "StartServiceW";           Dll = "advapi32.dll"; ReturnType = [BOOL];   Parameters = [Type[]]@([IntPtr],[Int32],[IntPtr]) },
-        @{ Name = "QueryServiceStatusEx";    Dll = "advapi32.dll"; ReturnType = [BOOL];   Parameters = [Type[]]@([IntPtr],[Int32],[IntPtr],[Int32],[UInt32].MakeByRefType()) }
+        @{ Name = "QueryServiceStatusEx";    Dll = "advapi32.dll"; ReturnType = [BOOL];   Parameters = [Type[]]@([IntPtr],[Int32],[IntPtr],[Int32],[UInt32].MakeByRefType()) },
+        @{ Name = "CreateProcessWithTokenW"; Dll = "advapi32.dll"; ReturnType = [BOOL];   Parameters = [Type[]]@([IntPtr], [Int32], [IntPtr], [IntPtr], [Int32], [IntPtr],[IntPtr],[IntPtr],[IntPtr]) }
     )
     return Register-NativeMethods $functions
 }
 Function Init-KERNEL32 {
 
     $functions = @(
+        @{ Name = "RevertToSelf";            Dll = "KernelBase.dll"; ReturnType = [bool]; Parameters = [Type[]]@() },
+        @{ Name = "ImpersonateLoggedOnUser"; Dll = "KernelBase.dll"; ReturnType = [bool]; Parameters = [Type[]]@([IntPtr]) },
         @{ Name = "FindFirstFileW"; Dll = "KernelBase.dll"; ReturnType = [IntPtr]; Parameters = [Type[]]@([string], [IntPtr]) },
         @{ Name = "FindNextFileW";  Dll = "KernelBase.dll"; ReturnType = [bool];   Parameters = [Type[]]@([IntPtr], [IntPtr]) },
         @{ Name = "FindClose";      Dll = "KernelBase.dll"; ReturnType = [bool];   Parameters = [Type[]]@([IntPtr]) },
@@ -10295,31 +10299,24 @@ Function Process-UserToken {
     }
 }
 function Get-ProcessHandle {
-    [CmdletBinding(DefaultParameterSetName = 'ByService')]
     param (
-        [Parameter(Mandatory = $true, ParameterSetName = 'ByProcessId')]
         [int] $ProcessId,
-
-        [Parameter(Mandatory = $true, ParameterSetName = 'ByProcessName')]
         [string] $ProcessName,
-
-        [Parameter(Mandatory = $true, ParameterSetName = 'ByService')]
-        [string] $ServiceName
+        [string] $ServiceName,
+        [switch] $Impersonat
     )
 
     # Constants
     $SC_MANAGER_CONNECT        = 0x0001
     $SC_MANAGER_CREATE_SERVICE = 0x0002
     $SERVICE_QUERY_STATUS      = 0x0004
-    $PROCESS_ALL_ACCESS        = 0x1F0FFF
-    $PROCESS_CREATE_PROCESS    = 0x0080
     $SERVICE_START             = 0x0010
     $SERVICE_QUERY_STATUS      = 0x0004
 
     $scManager = $tiService = [IntPtr]::Zero
     $buffer = $clientIdPtr = $attributesPtr = [IntPtr]::Zero
 
-    function Open-HandleFromPid($ProcID) {
+    function Open-HandleFromPid($ProcID, $IsProcessToken) {
         try {
             
             $handle = [IntPtr]::Zero
@@ -10335,38 +10332,69 @@ function Get-ProcessHandle {
             $attributesPtr = New-IntPtr -Size $objectAttrSize -WriteSizeAtZero
             $clientIdPtr   = New-IntPtr -Size $clientIdSize   -InitialValue $ProcID -UsePointerSize
             $ntStatus = $Global:ntdll::NtOpenProcess(
-                [ref]$handle, $PROCESS_ALL_ACCESS, $attributesPtr, $clientIdPtr)
+                [ref]$handle, 0x1F0FFF, $attributesPtr, $clientIdPtr)
 
             if ($ntStatus -ne 0) {
                 Start-Sleep 1
                 write-warning "get handle using PROCESS_ALL_ACCESS failed, re-try with PROCESS_CREATE_PROCESS"
                 $ntStatus = $Global:ntdll::NtOpenProcess(
-                    [ref]$handle, $PROCESS_CREATE_PROCESS, $attributesPtr, $clientIdPtr)
+                    [ref]$handle, (0x0080 -bor 0x0800 - 0x0040), $attributesPtr, $clientIdPtr)
+            }
+            if (!$Impersonat) {
+                return $handle
+            }
+            $tokenHandle = [IntPtr]::Zero
+            $ret = $Global:ntdll::NtOpenProcessToken(
+                $handle, (0x02 -bor 0x01 -bor 0x08), [ref]$tokenHandle
+            )
+            Free-IntPtr -handle $handle -Method NtHandle
+            if ($tokenHandle -eq [IntPtr]::Zero) {
+                throw "NtOpenProcessToken failue .!"
+            }
+            if (!($Global:kernel32::ImpersonateLoggedOnUser(
+                $tokenHandle))) {
+                throw "ImpersonateLoggedOnUser failue .!"
             }
 
-            return $handle
+            $NewTokenHandle = [IntPtr]0
+            $ret = $Global:ntdll::NtDuplicateToken(
+                $tokenHandle,
+                (0x0080 -bor 0x0100 -bor 0x08 -bor 0x02 -bor 0x01),
+                [IntPtr]0, $false, 0x01,
+                [ref]$NewTokenHandle
+            )
+            Free-IntPtr -handle $tokenHandle -Method NtHandle
+
+            $null = $Global:kernel32::RevertToSelf()
+            return $NewTokenHandle
         }
         finally {
             Free-IntPtr -handle $clientIdPtr
             Free-IntPtr -handle $attributesPtr
         }
     }
-
     try {
-        switch ($PSCmdlet.ParameterSetName) {
-            'ByProcessId' {
-                return Open-HandleFromPid -ProcID $ProcessId
+            if ($ProcessId -ne 0) {
+                if ($Impersonat) {
+                    return Open-HandleFromPid -ProcID $ProcessId -IsProcessToken $true
+                } else {
+                    return Open-HandleFromPid -ProcID $ProcessId
+                }
             }
 
-            'ByProcessName' {
+            if (![string]::IsNullOrEmpty($ProcessName)) {
                 $proc = Query-Process -ProcessName $ProcessName -First
                 if ($proc -and $proc.UniqueProcessId) {
-                    return Open-HandleFromPid -ProcID $proc.UniqueProcessId
+                    if ($Impersonat) {
+                        return Open-HandleFromPid -ProcID $proc.UniqueProcessId -IsProcessToken $true
+                    } else {
+                        return Open-HandleFromPid -ProcID $proc.UniqueProcessId
+                    }
                 }
                 throw "Error receive ID for selected Process"
             }
 
-            'ByService' {
+            if (![string]::IsNullOrEmpty($ServiceName)) {
                 $ReturnLength = 0
                 $dwDesiredAccess = $SC_MANAGER_CONNECT -bor $SC_MANAGER_CREATE_SERVICE
                 $hSCManager = $Global:advapi32::OpenSCManagerW(0,0,$dwDesiredAccess)
@@ -10425,10 +10453,12 @@ function Get-ProcessHandle {
                 
                 start-sleep -Seconds 1
                 $svcProcID = [Marshal]::ReadInt32($lpBuffer, 28)
-                $svcHandle = Open-HandleFromPid -ProcID ($svcProcID)
-                return $svcHandle
+                if ($Impersonat) {
+                    return Open-HandleFromPid -ProcID $svcProcID -IsProcessToken $true
+                } else {
+                    return Open-HandleFromPid -ProcID $svcProcID
+                }
             }
-        }
     }
     finally {
         Free-IntPtr -handle $lpBuffer
@@ -10436,6 +10466,64 @@ function Get-ProcessHandle {
         Free-IntPtr -handle $hSCManager -Method ServiceHandle
         Free-IntPtr -handle $hService   -Method ServiceHandle
         $lpBuffer = $lpServiceName = $hSCManager = $hService = $null
+    }
+}
+Function Get-ProcessHelper {
+        param (
+            [int]    $ProcessId,
+            [string] $ProcessName,
+            [string] $ServiceName,
+            [bool]   $Impersonat
+        )
+    <#
+        Work with this Services:
+        * cmd
+        * lsass
+        * spoolsv
+        * Winlogon
+        * TrustedInstaller
+        * OfficeClickToRun
+
+        And a lot of more, some service / Apps
+        like Amd* GoodSync, etc, can be easyly use too.
+
+    #>
+
+    if ($ProcessName) {
+        $Service = Get-CimInstance -ClassName Win32_Service -Filter "PathName LIKE '%$($ProcessName).exe%'" | Select-Object -Last 1
+    }
+    else {
+        $Service = Get-CimInstance -ClassName Win32_Service -Filter "name = '$ServiceName'" | Select-Object -Last 1
+    }
+    if ($Service) {
+                
+        if ($Service.state -eq 'Running') {
+            $ProcessId = [Int32]::Parse($Service.ProcessId)
+            if ($Impersonat) {
+                return Get-ProcessHandle -ProcessId $ProcessId -Impersonat
+            } else {
+                return Get-ProcessHandle -ProcessId $ProcessId
+            }
+        }
+        else {
+            # Managed Code fail to get handle,
+            # if service need [re] Start. 
+            # so, i have to call function twice
+            # instead, this, work on first place.!
+            $ServiceName = $Service.Name
+            if ($Impersonat) {
+                return Get-ProcessHandle -ServiceName $ServiceName -Impersonat
+            } else {
+                return Get-ProcessHandle -ServiceName $ServiceName
+            }
+        }
+    } 
+    elseif ($ProcessName) {
+        if ($Impersonat) {
+            return Get-ProcessHandle -ProcessName $ProcessName -Impersonat
+        } else {
+            return Get-ProcessHandle -ProcessName $ProcessName
+        }
     }
 }
 
@@ -10478,6 +10566,11 @@ https://www.ired.team/offensive-security/privilege-escalation
 * github Source C Code
 * https://github.com/RubisetCie/god-mode
 
+* fgsec (Felipe Gaspar) · GitHub
+* https://github.com/fgsec/SharpGetSystem
+* https://github.com/fgsec/Offensive/tree/master
+* https://github.com/fgsec/SharpTokenTheft/tree/main
+
 --------------
 
 SERVICE_STATUS structure (winsvc.h)
@@ -10485,27 +10578,24 @@ https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_sta
 
 --------------
 
-# Create Process AS Normal USER
-$ret = Invoke-Process `
+Clear-Host
+Write-Host
+
+Invoke-Process `
     -CommandLine "cmd /k whoami" `
     -RunAsConsole `
     -WaitForExit
 
-# Create Process AS System, using TrustedInstaller service
-$ret = Invoke-Process `
+Invoke-Process `
     -CommandLine "cmd /k whoami" `
-    -ServiceName TrustedInstaller `
+    -ProcessName TrustedInstaller `
     -RunAsConsole `
-    -WaitForExit `
-    -RunAsTI
+    -RunAsParent
 
-# Create Process AS System, using winlogon Process
-$ret = Invoke-Process `
+Invoke-Process `
     -CommandLine "cmd /k whoami" `
     -ProcessName winlogon `
-    -RunAsConsole `
-    -WaitForExit `
-    -RunAsTI
+    -RunAsConsole -UseDuplicatedToken
 
 # Could Fail to start from system/TI
 Write-Host 'Invoke-ProcessAsUser, As Logon' -ForegroundColor Green
@@ -10558,20 +10648,22 @@ Function Invoke-Process {
         [switch] $RunAsConsole,
 
         [Parameter(Mandatory=$false)]
-        [switch] $RunAsTI
+        [switch] $RunAsParent,
+
+        [Parameter(Mandatory=$false)]
+        [switch] $UseDuplicatedToken
     )
 
     try {
         $tHandle = [IntPtr]::Zero
 
-        if (-not ($ProcessName -xor $ServiceName)) {
-            if (-not (!$RunAsTI -and !$ProcessName -and !$ServiceName)) {
-                throw "Please Use -ProcessName or -ServiceName Parameters"
+        if ($ProcessName -or $ServiceName -or $RunAsParent -or $UseDuplicatedToken) {
+            if (!($ProcessName -xor $ServiceName)) {
+                throw "Please Provide ProcessName -or ServiceName"
             }
-        }
-
-        if (($ProcessName -or $ServiceName) -and !$RunAsTI) {
-            throw "-ProcessName or -ServiceName Parameters, Must Run with -RunAsTI"
+            if (!($RunAsParent -xor $UseDuplicatedToken)) {
+                throw "-ProcessName or -ServiceName Parameters, Must Run with -RunAsParent or -UseDuplicatedToken"
+            }
         }
 
         $ret = Adjust-TokenPrivileges -Privilege SeDebugPrivilege -SysCall
@@ -10606,46 +10698,13 @@ Function Invoke-Process {
         $lpAttributeList = New-IntPtr -Size $lpAttributeListSize
         [Marshal]::WriteInt32($lpAttributeList, 4, 1)
 
-        if ($RunAsTI) {
+        if ($RunAsParent) {
             
-            <#
-                Work with this Services:
-                * cmd
-                * lsass
-                * spoolsv
-                * Winlogon
-                * TrustedInstaller
-                * OfficeClickToRun
-
-                And a lot of more, some service / Apps
-                like Amd* GoodSync, etc, can be easyly use too.
-
-            #>
-
-            if ($ProcessName) {
-                $Service = Get-CimInstance -ClassName Win32_Service -Filter "PathName LIKE '%$($ProcessName).exe%'" | Select-Object -Last 1
-            }
-            else {
-                $Service = Get-CimInstance -ClassName Win32_Service -Filter "name = '$ServiceName'" | Select-Object -Last 1
-            }
-            if ($Service) {
-                
-                if ($Service.state -eq 'Running') {
-                    $ProcessId = [Int32]::Parse($Service.ProcessId)
-                    $tHandle = Get-ProcessHandle -ProcessId $ProcessId
-                }
-                else {
-                    # Managed Code fail to get handle,
-                    # if service need [re] Start. 
-                    # so, i have to call function twice
-                    # instead, this, work on first place.!
-                    $ServiceName = $Service.Name
-                    $tHandle = Get-ProcessHandle -ServiceName $ServiceName
-                }
-            } 
-            elseif ($ProcessName) {
-                $tHandle = Get-ProcessHandle -ProcessName $ProcessName
-            }
+            $tHandle = Get-ProcessHelper `
+                -ProcessId $ProcessId `
+                -ProcessName $ProcessName `
+                -ServiceName $Service `
+                -Impersonat $false
 
             # Allocate unmanaged memory for the handle pointer
             if (-not (IsValid-IntPtr $tHandle)) {
@@ -10667,6 +10726,13 @@ Function Invoke-Process {
                 [Marshal]::WriteInt32($lpAttributeList, 0x1C, $handlePtr)
             }
         }
+        if ($UseDuplicatedToken) {
+            $tHandle = Get-ProcessHelper `
+                -ProcessId $ProcessId `
+                -ProcessName $ProcessName `
+                -ServiceName $Service `
+                -Impersonat $true
+        }
         
         # Now, Update -> lpAttributeList
         if ([IntPtr]::Size -eq 8) {
@@ -10678,9 +10744,25 @@ Function Invoke-Process {
         }
       
         $CommandLinePtr = [Marshal]::StringToHGlobalUni($CommandLine)
-
-        $Global:kernel32::CreateProcessW(
-            0, $CommandLinePtr, 0, 0, $false, $flags, 0, 0, $startupInfo, $processInfo)
+        if ($UseDuplicatedToken) {
+            $flags = 0x00000004 -bor 0x00000010
+            #$ret = Invoke-UnmanagedMethod -Dll Advapi32 -Function CreateProcessWithTokenW -CallingConvention StdCall -Return bool -CharSet Unicode -Values @(
+            $ret = $Global:advapi32::CreateProcessWithTokenW(
+                $tHandle,        # handle from process / user
+                0x00000001,      # LOGON_WITH_PROFILE
+                [IntPtr]0,       # lpApplicationName
+                $CommandLinePtr, # lpCommandLine
+                $flags,          # dwCreationFlags
+                [IntPtr]0,       # lpEnvironment
+                [IntPtr]0,       # lpCurrentDirectory
+                $startupInfo,    # lpStartupInfo
+                $processInfo     # lpProcessInformation
+            )
+        } else {
+            # Call CreateProcessAsUserW (needs the duplicated Primary Token)
+            $ret = $Global:kernel32::CreateProcessW(
+                0, $CommandLinePtr, 0, 0, $false, $flags, 0, 0, $startupInfo, $processInfo)
+        }
         
         $err = [Marshal]::GetLastWin32Error()
         if (!$ret) {
@@ -10691,12 +10773,6 @@ Function Invoke-Process {
 
         $hProcess = [Marshal]::ReadIntPtr($processInfo, 0x0)
         $hThread  = [Marshal]::ReadIntPtr($processInfo, [IntPtr]::Size)
-        
-        $ret = Adjust-TokenPrivileges -hProcess $hProcess -AdjustAll -SysCall
-        if (!$ret) {
-            Write-Host "Fail to Adjust Token Privileges for $hProcess"
-        }
-        
         $ret = $Global:kernel32::ResumeThread($hThread)
         if (!$ret) {
             return $false
@@ -10706,7 +10782,6 @@ Function Invoke-Process {
             $null = $Global:kernel32::WaitForSingleObject(
                 $hProcess, 0xFFFFFFFF)
         }
-
         return $true
     }
     Finally {
@@ -10860,11 +10935,12 @@ catch {
             [Marshal]::WriteInt32([IntPtr]::Add($lpStartupInfo, $OffsetList.ShowWindowFlags), 0x05)
 
             # Call internally to Advapi32->CreateProcessWithLogonCommonW->RPC call
-            $ret = Invoke-UnmanagedMethod -Dll Advapi32 -Function CreateProcessWithTokenW -CallingConvention StdCall -Return bool -CharSet Unicode -Values @(
+            $homeDrive = [marshal]::StringToCoTaskMemUni("c:\")
+            $ret = $Global:advapi32::CreateProcessWithTokenW(
                 $hToken,
                 0x00000001,
                 $ApplicationPtr, $CommandLinePtr,
-                $flags, $lpEnvironment, "c:\", $lpStartupInfo, $lpProcessInformation
+                $flags, $lpEnvironment, $homeDrive, $lpStartupInfo, $lpProcessInformation
             )
 
             # Clean Params laters
@@ -10925,7 +11001,7 @@ catch {
         ($hProcess, $hThread) | % { Free-IntPtr $_ -Method NtHandle }
         ($lpProcessInformation, $lpStartupInfo, $ApplicationPtr) | % { Free-IntPtr $_ }
         ($CommandLinePtr, $UserNamePtr, $PasswordPtr, $DomainPtr) | % { Free-IntPtr $_ }
-        ($lpDesktopPtr) | % { Free-IntPtr $_ }
+        ($lpDesktopPtr, $homeDrive) | % { Free-IntPtr $_ }
     }
 }
 
