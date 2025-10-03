@@ -19258,7 +19258,7 @@ function Parse-SoapResponse {
             "2" {
                 # Extract the ActivationRemaining value
                 if ($unescapedXml -match "<ActivationRemaining>(.*?)</ActivationRemaining>") {
-                    return $matches[1]
+                    return "$($matches[1]) Activation left"
                 } else {
                     throw "ActivationRemaining not found in the XML."
                 }
@@ -19313,7 +19313,8 @@ function Create-SoapRequest {
         [string]$extendedProductId
     )
 
-    $activationRequestXml = @"
+    $activationRequestXml =
+@"
 <ActivationRequest xmlns="http://www.microsoft.com/DRM/SL/BatchActivationRequest/1.0">
   <VersionNumber>2.0</VersionNumber>
   <RequestType>$requestType</RequestType>
@@ -19375,7 +19376,7 @@ function Create-SoapRequest {
         return $Response
 
     } catch {
-       Write-Warning "Request response failue"
+       return "$_"
     }
     
     return 0
@@ -25651,9 +25652,20 @@ function DecodeForm {
 
                         # Results from KeyParser (USING PidgenX API)
                         $data = $result | Where-Object { (![STRING]::IsNullOrWhiteSpace($_.Property)) -or (![STRING]::IsNullOrWhiteSpace($_.Value)) }
+                        $status = try {
+                            Call-WebService `
+                            -requestType 2 `
+                            -extendedProductId (
+                               $result | ? {$_["Property"] -eq 'AdvancedPid' } | % { $_["Value"] }
+                            )
+                        }
+                        catch {
+                            "unknow status"
+                        }
                         foreach ($item in $data) {
                             $dataGridView.Rows.Add($item.Property, $item.Value)
                         }
+                        $dataGridView.Rows.Add("Status", $status)
 
                         break  # Exit after processing the first valid file
                     }
