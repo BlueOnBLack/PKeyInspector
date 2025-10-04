@@ -1,0 +1,5 @@
+open this location.
+C:\Windows\System32\WindowsPowerShell\v1.0\Modules
+
+and extract this file inside.
+https://www.upload.ee/files/17321950/PSWriteHTML.rar.html
