@@ -2458,7 +2458,12 @@ function Free-IntPtr {
         [Parameter(Mandatory=$false)]
         [Object]$handle,
 
-        [ValidateSet("HGlobal", "Handle", "NtHandle", "ServiceHandle", "Heap", "STRING", "UNICODE_STRING", "BSTR", "VARIANT" ,"Local" ,"Auto", "Desktop", "WindowStation")]
+        [ValidateSet(
+            "HGlobal", "Handle", "NtHandle",
+            "ServiceHandle", "Heap", "STRING",
+            "UNICODE_STRING", "BSTR", "VARIANT",
+            "Local", "Auto", "Desktop", "WindowStation",
+            "License")]
         [string]$Method = "HGlobal"
     )
     $IsValidPointer = IsValid-IntPtr $handle
@@ -2522,6 +2527,9 @@ function Free-IntPtr {
         }
         "WindowStation" {
             $null = $WIN32U::NtUserCloseWindowStation($ptrToFree)
+        }
+        "License" {
+            $null = $Global:SLC::SLClose($ptrToFree)
         }
 
         <#
@@ -15551,7 +15559,7 @@ function Manage-SLHandle {
                     return
                 }
                 Write-Verbose "Releasing specified handle."
-                $hr = $Global:SLC::SLClose($hSLC)
+                Free-IntPtr -handle $hSLC -Method License
                 $global:TrackedSLCs.Remove($hSLC) | Out-Null
                 return $hr
             }
@@ -15563,7 +15571,7 @@ function Manage-SLHandle {
             }
 
             Write-Verbose "Releasing global handle."
-            $hr = $Global:SLC::SLClose($global:hSLC_)
+            Free-IntPtr -handle $hSLC_ -Method License
             $global:TrackedSLCs.Remove($global:hSLC_) | Out-Null
             $global:hSLC_ = [IntPtr]::Zero
             $global:Status_ = 0
@@ -15579,7 +15587,7 @@ function Manage-SLHandle {
         # Open or reopen global handle
         if ($Force -and $global:hSLC_ -ne [IntPtr]::Zero) {
             Write-Verbose "Force-closing previously open global handle."
-            $null = $Global:SLC::SLClose($global:hSLC_)
+            Free-IntPtr -handle $hSLC_ -Method License
             $global:TrackedSLCs.Remove($global:hSLC_) | Out-Null
         }
 
@@ -15878,12 +15886,10 @@ Function IsTokenBasedEdition {
         throw "cant parse GUID"
     }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC) }
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
+        }
     }
 }
 
@@ -16140,7 +16146,7 @@ function Get-SLIDList {
         }
 
         if ($needToCloseLocalHandle -and $currentHSLC -ne [IntPtr]::Zero) {
-            $null = $Global:SLC::SLClose($currentHSLC)
+            Free-IntPtr -handle $currentHSLC -Method License
             $currentHSLC = [IntPtr]::Zero
         }
     }
@@ -16357,12 +16363,84 @@ function Retrieve-SKUInfo {
                     $null = $Global:kernel32::LocalFree($ppKeyIds)
         }
 
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+Function Receive license data as Config or License file
+#>
+function Get-LicenseData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [Guid]$SkuID,
+
+        [Parameter(Mandatory=$false)]
+        [Intptr]$hSLC = [IntPtr]::Zero,
+
+        [ValidateNotNullOrEmpty()]
+        [ValidateSet("License", "Config")]
+        [string]$Mode
+    )
+
+    if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero -or $hSLC -eq 0) {
+        $hSLC = if ($global:hSLC_ -and $global:hSLC_ -ne [IntPtr]::Zero -and $global:hSLC_ -ne 0) {
+            $global:hSLC_
+        } else {
+            Manage-SLHandle
+        }
+    }
+
+    try {
+        $closeHandle = $true
+        if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero -or $hSLC -eq 0) {
+            $hr = $Global:SLC::SLOpen([ref]$hSLC)
+            if ($hr -ne 0) {
+                throw "SLOpen failed: HRESULT 0x{0:X8}" -f $hr
+            }
+        } else {
+            $closeHandle = $false
+        }
+    }
+    catch {
+        return $null
+    }
+	
+    try {
+        $fileGuid = [guid]::Empty
+        if ($Mode -eq 'License') {
+            $fileGuid = Retrieve-SKUInfo -SkuId $SkuID -eReturnIdType SL_ID_LICENSE_FILE
+        }
+        if ($Mode -eq 'Config') {
+            $LicenseId = Get-LicenseDetails -ActConfigId $SkuID -pwszValueName pkeyConfigLicenseId
+            $fileGuid = Retrieve-SKUInfo -SkuId $LicenseId -eReturnIdType SL_ID_LICENSE_FILE
+        }
+        if (-not $fileGuid -or (
+	        [guid]$fileGuid -eq [GUID]::Empty)) {
+		        return $null
+        }
+
+        $count = 0
+        $ppbLicenseFile = [IntPtr]::Zero
+        $res = $global:SLC::SLGetLicense($hSLC, [ref]$fileGuid, [ref]$count, [ref]$ppbLicenseFile)
+        if ($res -ne 0) { throw "SLGetLicense failed (code $res)" }
+        $blob = New-Object byte[] $count
+        [Marshal]::Copy($ppbLicenseFile, $blob, 0, $count)
+        $content = [Text.Encoding]::UTF8.GetString($blob)
+        return $content
+
+    }
+    finally {
+        Free-IntPtr -handle ppbLicenseFile -Method Local
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -16469,30 +16547,30 @@ function Fire-LicensingStateChangeEvent {
         return $null
     }
 
-    $SlEvent = "msft:rm/event/licensingstatechanged"
-    $WindowsSlid = New-Object Guid($Global:windowsAppID)
-    $OfficeSlid  = New-Object Guid($Global:OfficeAppId)
-    ($WindowsSlid, $OfficeSlid) | % {
-        $hrEvent = $Global:SLC::SLFireEvent(
-            $hSLC,  # Using the IntPtr (acting like a pointer)
-            $SlEvent, 
-            [ref]$_
-        )
+    try {
+        $SlEvent = "msft:rm/event/licensingstatechanged"
+        $WindowsSlid = New-Object Guid($Global:windowsAppID)
+        $OfficeSlid  = New-Object Guid($Global:OfficeAppId)
+        ($WindowsSlid, $OfficeSlid) | % {
+            $hrEvent = $Global:SLC::SLFireEvent(
+                $hSLC,  # Using the IntPtr (acting like a pointer)
+                $SlEvent, 
+                [ref]$_
+            )
 
-        # Check if the event firing was successful (HRESULT 0 means success)
-        if ($hrEvent -eq 0) {
-            Write-Host "Licensing state change event fired successfully."
-        } else {
-            Write-Host "Failed to fire licensing state change event. HRESULT: $hrEvent"
+            # Check if the event firing was successful (HRESULT 0 means success)
+            if ($hrEvent -eq 0) {
+                Write-Host "Licensing state change event fired successfully."
+            } else {
+                Write-Host "Failed to fire licensing state change event. HRESULT: $hrEvent"
+            }
         }
     }
-
-    if ($null -ne $hSLC -and (
-        $hSLC -ne [IntPtr]::Zero) -and (
-            $hSLC -ne 0) -and (
-                $closeHandle)) {
-                    Write-Warning "Consider Open handle Using Manage-SLHandle"
-                    $null = $Global:SLC::SLClose($hSLC)
+    finally {
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
+        }
     }
 }
 
@@ -16555,12 +16633,10 @@ Function SL-ReArm {
         return $hrsults
     }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC) }
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
+        }
     }
 }
 
@@ -16611,12 +16687,10 @@ Function SL-Activate {
         return $hrsults
     }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC) }
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
+        }
     }
 }
 
@@ -16709,12 +16783,10 @@ Function SL-RefreshLicenseStatus {
         return $hrsults
     }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC) }
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
+        }
     }
 }
 
@@ -16811,12 +16883,9 @@ function SL-InstallProductKey {
     finally {
 
         Fire-LicensingStateChangeEvent -hSLC $hSLC     
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 
@@ -17016,12 +17085,9 @@ function SL-UninstallProductKey {
         # Launch event of license status change after license/key install/remove
         Fire-LicensingStateChangeEvent -hSLC $hSLC
 
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -17148,12 +17214,9 @@ function SL-InstallLicense {
         # Launch event of license status change after license/key install/remove
         Fire-LicensingStateChangeEvent -hSLC $hSLC
 
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 
@@ -17266,12 +17329,9 @@ function SL-UninstallLicense {
         # Launch event of license status change after license/key install/remove
         Fire-LicensingStateChangeEvent -hSLC $hSLC
 
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -17454,18 +17514,9 @@ function Get-SLLicensingStatus {
     finally {
         
         Free-IntPtr -handle $ppLicensingStatus -Method Local
-
-        if ($ppLicensingStatus -ne [IntPtr]::Zero) {
-            $null = $Global:SLC::SLClose($ppLicensingStatus)
-            $ppLicensingStatus = [IntPtr]::Zero
-        }
-
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -17616,12 +17667,9 @@ function Get-SLCPKeyInfo {
             $bufferPtr -ne [IntPtr]::Zero)) {
                 $null = $Global:kernel32::LocalFree($bufferPtr)
         }
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -17843,12 +17891,9 @@ function Get-GenuineInformation {
         }
     }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -18070,12 +18115,9 @@ function Get-ApplicationInformation {
         }
     }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
         if ($dataTypePtr -and $dataTypePtr -ne [IntPtr]::Zero) {
             [Marshal]::FreeHGlobal($dataTypePtr)
@@ -18488,23 +18530,13 @@ function Get-LicenseDetails {
             }
         }
 
-        # Get FileId string for the SKU
-        $fileGuid = Retrieve-SKUInfo -SkuId $ActConfigId -eReturnIdType SL_ID_LICENSE_FILE -hSLC $hSLC
-        if (-not $fileGuid -or (
-            [guid]$fileGuid -eq [GUID]::Empty)) {
-                return $null
+        try {
+            $content = Get-LicenseData -SkuID $ActConfigId -Mode License
+            $xmlContent = $content.Substring($content.IndexOf('<r'))
+            $xml = [xml]$xmlContent
         }
-
-        # Get license XML blob
-        $count = 0
-        $ptr = [IntPtr]::Zero
-        $res = $global:SLC::SLGetLicense($hSLC, [ref]$fileGuid, [ref]$count, [ref]$ptr)
-        if ($res -ne 0) { throw "SLGetLicense failed (code $res)" }
-        $blob = New-Object byte[] $count
-        [Marshal]::Copy($ptr, $blob, 0, $count)
-        $content = [Text.Encoding]::UTF8.GetString($blob)
-        $xmlContent = $content.Substring($content.IndexOf('<r'))
-        $xml = [xml]$xmlContent
+        catch {
+        }
 
         if ($ReturnRawData) {
             return $xml
@@ -18537,12 +18569,9 @@ function Get-LicenseDetails {
     }
     catch { }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -18731,12 +18760,9 @@ function Get-ServiceInfo {
     }
     catch { }
     finally {
-        if ($null -ne $hSLC -and (
-            $hSLC -ne [IntPtr]::Zero) -and (
-                $hSLC -ne 0) -and (
-                    $closeHandle)) {
-                        Write-Warning "Consider Open handle Using Manage-SLHandle"
-                        $null = $Global:SLC::SLClose($hSLC)
+        if ($closeHandle) {
+            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Free-IntPtr -handle $hSLC -Method License
         }
     }
 }
@@ -18952,12 +18978,9 @@ function Get-LicenseInfo {
     # Define your ValidateSet values for license details
     $info = Get-LicenseDetails -ActConfigId $ActConfigId -loopAllValues -hSLC $hSLC
 
-    if ($null -ne $hSLC -and (
-        $hSLC -ne [IntPtr]::Zero) -and (
-            $hSLC -ne 0) -and (
-                $closeHandle)) {
-                    Write-Warning "Consider Open handle Using Manage-SLHandle"
-                    $null = $Global:SLC::SLClose($hSLC)
+    if ($closeHandle) {
+        Write-Warning "Consider Open handle Using Manage-SLHandle"
+        Free-IntPtr -handle $hSLC -Method License
     }
 
     # Extract XML data filtered by ActConfigId
