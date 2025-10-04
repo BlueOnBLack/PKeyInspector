@@ -19058,7 +19058,7 @@ function Get-LicenseInfo {
         TokenActivationILVID = $info["TokenActivationILVID"]
         TokenActivationGrantNumber = $info["TokenActivationGrantNumber"]
         TokenActivationCertificateThumbprint = $info["TokenActivationCertificateThumbprint"]
-        OfflineInstallationId = $ppwszInstallationId
+        OfflineInstallationId = $ppwszInstallation
 
         #KeyManagementServicePort = $info["KeyManagementServicePort"]
         #KeyManagementServiceName = if ($KeyManagementServiceInfo.KeyManagementServiceName) { $KeyManagementServiceInfo.KeyManagementServiceName } else { $null }
