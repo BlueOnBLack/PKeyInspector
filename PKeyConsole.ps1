@@ -37,6 +37,7 @@ param (
     [string]$LicensePattern = $null
 )
 
+Add-Type -AssemblyName System.Web
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 
@@ -14856,6 +14857,139 @@ function Create-SoapRequest {
     return 0
 }
 # ActivationWs project -->
+
+<#
+Based on idea from ->
+
+# Old source, work on W7
+# GetSLCertify.cs by laomms
+# https://forums.mydigitallife.net/threads/open-source-windows-7-product-key-checker.10858/page-14#post-1531837
+
+# new source, work on Windows 8 & up, N key's
+## keycheck.py by WitherOrNot
+## https://github.com/WitherOrNot/winkeycheck
+
+#>
+function Call-AltWebService ([string]$ProductKey, [Guid]$SkuID = [guid]::Empty) {
+    if ([string]::IsNullOrEmpty($ProductKey) -or (
+        $ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0)) {
+    }
+
+    $keyInfo = Decode-Key -Key $ProductKey
+    if ($SkuID -eq [guid]::Empty) {
+        $SkuId = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuId
+    }
+    if (!$SkuId -or !$keyInfo) {
+        Write-warning "Possible Error: SkuId not found for the product key."
+        Write-warning "Possible Error: Failed to decode product key."
+        return
+    }
+
+    # Start of original Encode-KeyData logic
+    [long]$group    = $keyInfo.Group
+    [long]$serial   = $keyInfo.Serial
+    [long]$security = $keyInfo.Security
+    [int32]$upgrade = $keyInfo.Upgrade
+
+    [System.Numerics.BigInteger]$act_hash = [BigInteger]$upgrade -band 1
+    $act_hash = $act_hash -bor (([BigInteger]$serial -band ((1L -shl 30) - 1)) -shl 1)
+    $act_hash = $act_hash -bor (([BigInteger]$group -band ((1L -shl 20) - 1)) -shl 31)
+    $act_hash = $act_hash -bor (([BigInteger]$security -band ((1L -shl 53) - 1)) -shl 51)
+    $bytes = $act_hash.ToByteArray()
+    $KeyData = New-Object 'Byte[]' 13
+    [Array]::Copy($bytes, 0, $KeyData, 0, [Math]::Min(13, $bytes.Length))
+    $act_data = [Convert]::ToBase64String($KeyData)
+    # End of original Encode-KeyData logic
+
+    $value = [HttpUtility]::HtmlEncode("msft2009:$SkuId&$act_data")
+    $requestXml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope
+    xmlns:soapenc="http://schemas.xmlsoap.org/soap/encoding/"
+    xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <soap:Body>
+        <RequestSecurityToken
+            xmlns="http://schemas.xmlsoap.org/ws/2004/04/security/trust">
+            <TokenType>PKC</TokenType>
+            <RequestType>http://schemas.xmlsoap.org/ws/2004/04/security/trust/Issue</RequestType>
+            <UseKey>
+                <Values xsi:nil="1"/>
+            </UseKey>
+            <Claims>
+                <Values
+                    xmlns:q1="http://schemas.xmlsoap.org/ws/2004/04/security/trust" soapenc:arrayType="q1:TokenEntry[3]">
+                    <TokenEntry>
+                        <Name>ProductKey</Name>
+                        <Value>$ProductKey</Value>
+                    </TokenEntry>
+                    <TokenEntry>
+                        <Name>ProductKeyType</Name>
+                        <Value>msft:rm/algorithm/pkey/2009</Value>
+                    </TokenEntry>
+                    <TokenEntry>
+                        <Name>ProductKeyActConfigId</Name>
+                        <Value>$value</Value>
+                    </TokenEntry>
+                </Values>
+            </Claims>
+        </RequestSecurityToken>
+    </soap:Body>
+</soap:Envelope>
+"@
+
+    try {
+        $response = $null
+        $webRequest = [System.Net.HttpWebRequest]::Create('https://activation.sls.microsoft.com/slpkc/SLCertifyProduct.asmx')
+        $webRequest.Method      = "POST"
+        $webRequest.Accept      = 'text/*'
+        $webRequest.UserAgent   = 'SLSSoapClient'
+        $webRequest.ContentType = 'text/xml; charset=utf-8'
+        $webRequest.Headers.Add("SOAPAction", "http://microsoft.com/SL/ProductCertificationService/IssueToken");
+
+        try {
+            $byteArray = [System.Text.Encoding]::UTF8.GetBytes($requestXml)
+            $webRequest.ContentLength = $byteArray.Length
+            $stream = $webRequest.GetRequestStream()
+            $stream.Write($byteArray, 0, $byteArray.Length)
+            $stream.Close()
+            $httpResponse = $webRequest.GetResponse()
+            $streamReader = New-Object System.IO.StreamReader($httpResponse.GetResponseStream())
+            $response = $streamReader.ReadToEnd()
+            $streamReader.Close()
+        }
+        catch [System.Net.WebException] {
+            if ($_.Exception) {
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $response = $reader.ReadToEnd().ToString()
+                $reader.Close()
+            }
+        }
+        catch {
+            Write-Error "Error: $($_.Exception.Message)"
+            $global:error = $_
+            return $null
+        }
+
+    }
+    catch {
+        Write-Error "Error: $($_.Exception.Message)"
+        return $null
+    }
+
+    if ($response -ne $null) {
+        [xml]$xmlResponse = $response
+        if ($xmlResponse.Envelope.Body.Fault -eq $null) {
+            return "Valid Key"
+        } else {
+            return Parse-ErrorMessage -MessageId ($xmlResponse.Envelope.Body.Fault.detail.HRESULT) -Flags ACTIVATION
+        }
+    }
+
+    return "Error: No response received.", "", $false
+}
 
 # oHook part -->
 $KeyBlock = @'
