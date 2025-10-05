@@ -19422,7 +19422,6 @@ function Call-AltWebService ([string]$ProductKey, [Guid]$SkuID = [guid]::Empty) 
         return
     }
 
-    # Start of original Encode-KeyData logic
     [long]$group    = $keyInfo.Group
     [long]$serial   = $keyInfo.Serial
     [long]$security = $keyInfo.Security
@@ -20624,7 +20623,7 @@ Generates product keys using:
      each time increasing the MaxTries limit by 5000.
      Stops once at least one key is found or the retry limit is reached.
 
-Based on abbodi1406’s logic:
+Based on abbodi1406 logic:
 https://forums.mydigitallife.net/threads/88595/page-6#post-1882091
 
 Examples:
@@ -23109,7 +23108,7 @@ enum LicenseStatusEnum {
     ExtendedGrace     = 6
 }
 enum LicenseCategory {
-    KMS38        # Valid until 2037–2038
+    KMS38        # Valid until 2038
     KMS4K        # Beyond 2038
     ShortTermVL  # Volume expiring within 6 months
     Unknown
