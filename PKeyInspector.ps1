@@ -19405,20 +19405,31 @@ Based on idea from ->
 # new source, work on Windows 8 & up, N key's
 # keycheck.py by WitherOrNot
 # https://github.com/WitherOrNot/winkeycheck
-
 #>
-function Call-AltWebService ([string]$ProductKey, [Guid]$SkuID = [guid]::Empty) {
-    if ([string]::IsNullOrEmpty($ProductKey) -or (
-        $ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0)) {
-    }
+function Validate-ProductKey {
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ProductKey,
 
+        [Parameter(Mandatory = $false)]
+        [Guid]$SkuID = [guid]::Empty
+    )
+
+    $IndexN = ([string]::IsNullOrEmpty($ProductKey) -or (
+        $ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0))
     $keyInfo = Decode-Key -Key $ProductKey
     if ($SkuID -eq [guid]::Empty) {
-        $SkuId = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuId
+        $SkuID = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuID
     }
-    if (!$SkuId -or !$keyInfo) {
-        Write-warning "Possible Error: SkuId not found for the product key."
-        Write-warning "Possible Error: Failed to decode product key."
+    if (!$SkuId -or !$keyInfo -or $IndexN) {
+        Clear-Host
+        Write-Host
+        Write-Host "** Verified process Failure:" -ForegroundColor Red
+        Write-host "** Product Key, N Index, Not found." -ForegroundColor Green
+        Write-host "** Possible Error: Failed to decode product key." -ForegroundColor Green
+        Write-host "** Possible Error: SkuId not found for the product key." -ForegroundColor Green
+        Write-Host
         return
     }
 
@@ -19437,7 +19448,7 @@ function Call-AltWebService ([string]$ProductKey, [Guid]$SkuID = [guid]::Empty) 
     $act_data = [Convert]::ToBase64String($KeyData)
     # End of original Encode-KeyData logic
 
-    $value = [HttpUtility]::HtmlEncode("msft2009:$SkuId&$act_data")
+    $value = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $requestXml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope
@@ -19537,39 +19548,34 @@ Based on idea from ->
 # new source, work on Windows 8 & up, N key's
 # keycheck.py by WitherOrNot
 # https://github.com/WitherOrNot/winkeycheck
-
 #>
-
 function Consume-ProductKey {
     param (
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$ProductKey,
-        
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('Retail', 'OEM', 'Volume', 'Volume:GVLK', 'Volume:MAK')]
-        [string]$LicenseType = 'Retail',
 
         [Parameter(Mandatory = $false)]
         [Guid]$SkuID = [guid]::Empty
     )
-    if ([string]::IsNullOrEmpty($ProductKey) -or (
-        $ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0)) {
-    }
-
+    $IndexN = ([string]::IsNullOrEmpty($ProductKey) -or `
+        ($ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0))
     $keyInfo = Decode-Key -Key $ProductKey
     if ($SkuID -eq [guid]::Empty) {
-        $SkuId = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuId
+        $SkuID = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuID
     }
-    $LicenseXml = Get-LicenseData -SkuID $SkuID -Mode License
-    $LicenseData = [HttpUtility]::HtmlEncode($LicenseXml)
-    if (!$SkuId -or !$keyInfo -or !$LicenseData) {
+    $LicenseURL  = Get-LicenseDetails -ActConfigId $SkuID -pwszValueName PAUrl ## GetUseLicenseURL
+    $LicenseData = [HttpUtility]::HtmlEncode((Get-LicenseData -SkuID $SkuID -Mode License))
+
+    if (!$SkuID -or !$keyInfo -or !$LicenseData -or !$LicenseURL -or $IndexN) {
         Clear-Host
         Write-Host
         Write-Host "** Consume process Failure:" -ForegroundColor Red
+        Write-host "** Couldn't find N. Index" -ForegroundColor Green
         Write-host "** Possible Error: Failed to decode product key." -ForegroundColor Green
-        Write-host "** Possible Error: SkuId not found for the product key." -ForegroundColor Green
+        Write-host "** Possible Error: SkuID not found for the product key." -ForegroundColor Green
         Write-host "** Possible Error: Failed to Accuire License File for SKU Guid." -ForegroundColor Green
+        Write-host "** Possible Error: Can't find License URL." -ForegroundColor Green
         Write-Host
         return
     }
@@ -19598,7 +19604,7 @@ function Consume-ProductKey {
     $bindingData = [System.Convert]::ToBase64String((@($Binding) + @($RandomBytes)))
 
     $secure_store_id = [guid]::NewGuid()
-    $act_config_id = [HttpUtility]::HtmlEncode("msft2009:$SkuId&$act_data")
+    $act_config_id = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $systime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
     $utctime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
 
@@ -19691,7 +19697,7 @@ function Consume-ProductKey {
 
     try {
         $response = $null
-        $webRequest = [System.Net.HttpWebRequest]::Create('https://activation.sls.microsoft.com/SLActivateProduct/SLActivateProduct.asmx?configextension=$LicenseType')
+        $webRequest = [System.Net.HttpWebRequest]::Create($LicenseURL)
         $webRequest.Method      = "POST"
         $webRequest.Accept      = 'text/*'
         $webRequest.UserAgent   = 'SLSSoapClient'
@@ -19740,6 +19746,57 @@ function Consume-ProductKey {
 
     return "Error: No response received.", "", $false
 }
+
+<#
+Get-WindowsProductKey Helper
+Help manage DigitalProductId, DigitalProductId4, OA3xOriginalProductKey
+etc etc etc.
+#>
+function Get-WindowsProductKey {
+    
+    # Define the registry path
+    $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+
+    # Function to retrieve the product key
+    function Get-ProductKey($propertyName, $offset) {
+        $digitalProductId = (Get-ItemProperty -Path $registryPath).$propertyName
+        $byteArray = New-Object Byte[] ($digitalProductId.Length)
+        [Array]::Copy($digitalProductId, $byteArray, $digitalProductId.Length)
+        $bCDKey = $byteArray[$offset..($offset + 15)]
+        return Get-DigitalProductKey -bCDKeyArray $bCDKey
+    }
+
+    # Get the product keys
+    $DigitalProductIdKey = Get-ProductKey -propertyName "DigitalProductId" -offset 52
+    $DigitalProductIdKey4 = Get-ProductKey -propertyName "DigitalProductId4" -offset 808
+
+    # Retrieve additional product keys
+    $OA3xOriginalProductKey = Get-OA3xOriginalProductKey
+    #$OA3xOriginalProductKey = (Get-WmiObject -Class SoftwareLicensingService).OA3xOriginalProductKey
+    $BackupProductKeyDefault = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform" -ea 0).BackupProductKeyDefault
+
+    # Define default text if keys are not found
+    if (-not $OA3xOriginalProductKey) {
+        $OA3xOriginalProductKey = "Not Found"
+    }
+    if (-not $BackupProductKeyDefault) {
+        $BackupProductKeyDefault = "Not Found"
+    }
+
+    # Create a custom object to hold the keys
+    $productKeys = [PSCustomObject]@{
+        DigitalProductId         = $DigitalProductIdKey
+        DigitalProductId4     = $DigitalProductIdKey4
+        BackupProductKeyDefault   = $BackupProductKeyDefault
+		OA3xOriginalProductKey   = $OA3xOriginalProductKey
+    }
+
+    return $productKeys
+}
+
+# Start #
+# PidGenX API.
+# Begin #
 
 <#
 "PIDGenX failed with error code: 80070057"
@@ -19801,53 +19858,6 @@ typedef struct {
     WCHAR m_eulaType[64];
 } DigitalProductId4;
 #>
-
-function Get-WindowsProductKey {
-    
-    # Define the registry path
-    $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
-
-    # Function to retrieve the product key
-    function Get-ProductKey($propertyName, $offset) {
-        $digitalProductId = (Get-ItemProperty -Path $registryPath).$propertyName
-        $byteArray = New-Object Byte[] ($digitalProductId.Length)
-        [Array]::Copy($digitalProductId, $byteArray, $digitalProductId.Length)
-        $bCDKey = $byteArray[$offset..($offset + 15)]
-        return Get-DigitalProductKey -bCDKeyArray $bCDKey
-    }
-
-    # Get the product keys
-    $DigitalProductIdKey = Get-ProductKey -propertyName "DigitalProductId" -offset 52
-    $DigitalProductIdKey4 = Get-ProductKey -propertyName "DigitalProductId4" -offset 808
-
-    # Retrieve additional product keys
-    $OA3xOriginalProductKey = Get-OA3xOriginalProductKey
-    #$OA3xOriginalProductKey = (Get-WmiObject -Class SoftwareLicensingService).OA3xOriginalProductKey
-    $BackupProductKeyDefault = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform" -ea 0).BackupProductKeyDefault
-
-    # Define default text if keys are not found
-    if (-not $OA3xOriginalProductKey) {
-        $OA3xOriginalProductKey = "Not Found"
-    }
-    if (-not $BackupProductKeyDefault) {
-        $BackupProductKeyDefault = "Not Found"
-    }
-
-    # Create a custom object to hold the keys
-    $productKeys = [PSCustomObject]@{
-        DigitalProductId         = $DigitalProductIdKey
-        DigitalProductId4     = $DigitalProductIdKey4
-        BackupProductKeyDefault   = $BackupProductKeyDefault
-		OA3xOriginalProductKey   = $OA3xOriginalProductKey
-    }
-
-    return $productKeys
-}
-
-# Start #
-# PidGenX API.
-# Begin #
-
 function KeyParser {
     param (
         [string]$key,
@@ -20837,7 +20847,7 @@ Generates product keys using:
      each time increasing the MaxTries limit by 5000.
      Stops once at least one key is found or the retry limit is reached.
 
-Based on abbodi1406 logic:
+Based on abbodi1406's logic:
 https://forums.mydigitallife.net/threads/88595/page-6#post-1882091
 
 Examples:
@@ -22375,7 +22385,7 @@ function Get-LicenseData {
 
     }
     finally {
-        Free-IntPtr -handle ppbLicenseFile -Method Local
+        Free-IntPtr -handle $ppbLicenseFile -Method Local
         if ($closeHandle) {
             Write-Warning "Consider Open handle Using Manage-SLHandle"
             Free-IntPtr -handle $hSLC -Method License
@@ -26019,7 +26029,7 @@ function DecodeForm {
                 )
             } catch {}
             try {
-                $status2 = Call-AltWebService `
+                $status2 = Validate-ProductKey `
                     -ProductKey ($key.Substring(0,29)) `
                     -SkuID $skuID
             } catch {}
@@ -26060,7 +26070,7 @@ function DecodeForm {
                             )
                         } catch {}
                         try {
-                            $status2 = Call-AltWebService `
+                            $status2 = Validate-ProductKey `
                                 -ProductKey ($key.Substring(0,29)) `
                                 -SkuID $skuID
                         } catch {}

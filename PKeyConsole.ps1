@@ -14871,20 +14871,31 @@ Based on idea from ->
 # new source, work on Windows 8 & up, N key's
 # keycheck.py by WitherOrNot
 # https://github.com/WitherOrNot/winkeycheck
-
 #>
-function Call-AltWebService ([string]$ProductKey, [Guid]$SkuID = [guid]::Empty) {
-    if ([string]::IsNullOrEmpty($ProductKey) -or (
-        $ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0)) {
-    }
+function Validate-ProductKey {
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ProductKey,
 
+        [Parameter(Mandatory = $false)]
+        [Guid]$SkuID = [guid]::Empty
+    )
+
+    $IndexN = ([string]::IsNullOrEmpty($ProductKey) -or (
+        $ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0))
     $keyInfo = Decode-Key -Key $ProductKey
     if ($SkuID -eq [guid]::Empty) {
-        $SkuId = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuId
+        $SkuID = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuID
     }
-    if (!$SkuId -or !$keyInfo) {
-        Write-warning "Possible Error: SkuId not found for the product key."
-        Write-warning "Possible Error: Failed to decode product key."
+    if (!$SkuId -or !$keyInfo -or $IndexN) {
+        Clear-Host
+        Write-Host
+        Write-Host "** Verified process Failure:" -ForegroundColor Red
+        Write-host "** Product Key, N Index, Not found." -ForegroundColor Green
+        Write-host "** Possible Error: Failed to decode product key." -ForegroundColor Green
+        Write-host "** Possible Error: SkuId not found for the product key." -ForegroundColor Green
+        Write-Host
         return
     }
 
@@ -14903,7 +14914,7 @@ function Call-AltWebService ([string]$ProductKey, [Guid]$SkuID = [guid]::Empty) 
     $act_data = [Convert]::ToBase64String($KeyData)
     # End of original Encode-KeyData logic
 
-    $value = [HttpUtility]::HtmlEncode("msft2009:$SkuId&$act_data")
+    $value = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $requestXml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope
@@ -15003,39 +15014,34 @@ Based on idea from ->
 # new source, work on Windows 8 & up, N key's
 # keycheck.py by WitherOrNot
 # https://github.com/WitherOrNot/winkeycheck
-
 #>
-
 function Consume-ProductKey {
     param (
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$ProductKey,
-        
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('Retail', 'OEM', 'Volume', 'Volume:GVLK', 'Volume:MAK')]
-        [string]$LicenseType = 'Retail',
 
         [Parameter(Mandatory = $false)]
         [Guid]$SkuID = [guid]::Empty
     )
-    if ([string]::IsNullOrEmpty($ProductKey) -or (
-        $ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0)) {
-    }
-
+    $IndexN = ([string]::IsNullOrEmpty($ProductKey) -or `
+        ($ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0))
     $keyInfo = Decode-Key -Key $ProductKey
     if ($SkuID -eq [guid]::Empty) {
-        $SkuId = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuId
+        $SkuID = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuID
     }
-    $LicenseXml = Get-LicenseData -SkuID $SkuID -Mode License
-    $LicenseData = [HttpUtility]::HtmlEncode($LicenseXml)
-    if (!$SkuId -or !$keyInfo -or !$LicenseData) {
+    $LicenseURL  = Get-LicenseDetails -ActConfigId $SkuID -pwszValueName PAUrl ## GetUseLicenseURL
+    $LicenseData = [HttpUtility]::HtmlEncode((Get-LicenseData -SkuID $SkuID -Mode License))
+
+    if (!$SkuID -or !$keyInfo -or !$LicenseData -or !$LicenseURL -or $IndexN) {
         Clear-Host
         Write-Host
         Write-Host "** Consume process Failure:" -ForegroundColor Red
+        Write-host "** Couldn't find N. Index" -ForegroundColor Green
         Write-host "** Possible Error: Failed to decode product key." -ForegroundColor Green
-        Write-host "** Possible Error: SkuId not found for the product key." -ForegroundColor Green
+        Write-host "** Possible Error: SkuID not found for the product key." -ForegroundColor Green
         Write-host "** Possible Error: Failed to Accuire License File for SKU Guid." -ForegroundColor Green
+        Write-host "** Possible Error: Can't find License URL." -ForegroundColor Green
         Write-Host
         return
     }
@@ -15064,7 +15070,7 @@ function Consume-ProductKey {
     $bindingData = [System.Convert]::ToBase64String((@($Binding) + @($RandomBytes)))
 
     $secure_store_id = [guid]::NewGuid()
-    $act_config_id = [HttpUtility]::HtmlEncode("msft2009:$SkuId&$act_data")
+    $act_config_id = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $systime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
     $utctime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
 
@@ -15154,10 +15160,9 @@ function Consume-ProductKey {
     </soap:Body>
 </soap:Envelope>
 "@
-
     try {
         $response = $null
-        $webRequest = [System.Net.HttpWebRequest]::Create('https://activation.sls.microsoft.com/SLActivateProduct/SLActivateProduct.asmx?configextension=$LicenseType')
+        $webRequest = [System.Net.HttpWebRequest]::Create($LicenseURL)
         $webRequest.Method      = "POST"
         $webRequest.Accept      = 'text/*'
         $webRequest.UserAgent   = 'SLSSoapClient'
@@ -16787,7 +16792,7 @@ function Get-LicenseData {
 
     }
     finally {
-        Free-IntPtr -handle ppbLicenseFile -Method Local
+        Free-IntPtr -handle $ppbLicenseFile -Method Local
         if ($closeHandle) {
             Write-Warning "Consider Open handle Using Manage-SLHandle"
             Free-IntPtr -handle $hSLC -Method License
