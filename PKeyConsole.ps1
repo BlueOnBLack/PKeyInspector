@@ -14837,7 +14837,7 @@ function Create-SoapRequest {
 }
 
     # Create SOAP request
-    Write-Warning "$requestType, $installationId, $extendedProductId"
+    #Write-Warning "$requestType, $installationId, $extendedProductId"
     $soapRequest = Create-SoapRequest -requestType ([int]$requestType) -installationId $installationId -extendedProductId $extendedProductId
 
     # Create Web Request
@@ -14854,7 +14854,7 @@ function Create-SoapRequest {
         return $Response
 
     } catch {
-       Write-Warning "Request response failue"
+       return "$_"
     }
     
     return 0
@@ -15026,14 +15026,31 @@ function Consume-ProductKey {
     )
     $IndexN = ([string]::IsNullOrEmpty($ProductKey) -or `
         ($ProductKey.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -lt 0))
+    if ($IndexN) {
+        return
+    }
     $keyInfo = Decode-Key -Key $ProductKey
     if ($SkuID -eq [guid]::Empty) {
         $SkuID = Retrieve-ProductKeyInfo -CdKey $ProductKey | select -ExpandProperty SkuID
     }
+    if ($SkuID -eq $null -or $SkuID -eq [guid]::Empty) {
+        return
+    }
     $LicenseURL  = Get-LicenseDetails -ActConfigId $SkuID -pwszValueName PAUrl ## GetUseLicenseURL
-    $LicenseData = [HttpUtility]::HtmlEncode((Get-LicenseData -SkuID $SkuID -Mode License))
+    if (!$LicenseURL) {
+        return
+    }
+    $LicenseXML  = Get-LicenseData -SkuID $SkuID -Mode License
+    if (!$LicenseXML) {
+        return
+    }
+    if ($LicenseXML[0] -eq [char]0xFEFF) {
+        $LicenseXML = $LicenseXML.Substring(1)
+    }
+    $LicenseData = [HttpUtility]::HtmlEncode($LicenseXML)
 
-    if (!$SkuID -or !$keyInfo -or !$LicenseData -or !$LicenseURL -or $IndexN) {
+    if (!$SkuID -or !$keyInfo -or !$LicenseXML -or !$LicenseURL -or $IndexN) {
+        <#
         Clear-Host
         Write-Host
         Write-Host "** Consume process Failure:" -ForegroundColor Red
@@ -15043,6 +15060,7 @@ function Consume-ProductKey {
         Write-host "** Possible Error: Failed to Accuire License File for SKU Guid." -ForegroundColor Green
         Write-host "** Possible Error: Can't find License URL." -ForegroundColor Green
         Write-Host
+        #>
         return
     }
 
@@ -15073,7 +15091,6 @@ function Consume-ProductKey {
     $act_config_id = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $systime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
     $utctime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
-
     $requestXml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope
@@ -15140,11 +15157,11 @@ function Consume-ProductKey {
                     </TokenEntry>
                     <TokenEntry>
                         <Name>ClientSystemTime</Name>
-                        <Value>$systime</Value>
+                        <Value>$($systime)Z</Value>
                     </TokenEntry>
                     <TokenEntry>
                         <Name>ClientSystemTimeUtc</Name>
-                        <Value>$utctime</Value>
+                        <Value>$($utctime)Z</Value>
                     </TokenEntry>
                     <TokenEntry>
                         <Name>otherInfoPublic.secureStoreId</Name>
@@ -15210,6 +15227,273 @@ function Consume-ProductKey {
     }
 
     return "Error: No response received.", "", $false
+}
+
+<#
+Validate Key Helper.
+For Keys who matching local System Pkeyconfig file Only.!
+example usage.
+
+Clear-Host
+$Pattern = "`nProductKey:        {0}`nBatchActivation:   {1}`nSLCertifyProduct:  {2}`nSLActivateProduct: {3}"
+(Lookup-ProductKey `
+    -ProductKey @(
+        "XQ8WW-N6WGD-67K88-74XDH-RGG2T",
+        "GD4TT-HKNR7-PT36K-FF64G-PDQCT",
+        "7F6DW-3NH9Q-H46WY-8VTXC-MP46G",
+        "DH9CD-TKNQH-W3H7G-GD6JT-9K3CT",
+        "NC6G4-8B8VK-6V9JR-MFQ2R-4YCGG",
+        "PFFMJ-JNFFD-KDBF9-JFCTJ-GVPGG",
+        "NQJWP-FG6GT-HBP7G-K3M2R-KBXPT",
+        "DBCP8-RCNTK-H6KMC-MC674-WFKPT") `
+    -Consume) | % { 
+        ($Pattern -f $_.ProductKey, $_.BatchActivation, $_.SLCertifyProduct, $_.SLActivateProduct)
+    }
+Write-Host
+#>
+function Check-ProductKey {
+    param (
+        [string]$key,
+        [string]$configPath
+    )
+
+    try {
+        # Validate input
+        if ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($configPath)) {
+            throw "KEY and CONFIG PATH cannot be empty."
+        }
+
+        <#
+        sppcomapi.dll
+        __int64 __fastcall GetWindowsPKeyInfo(_WORD *a1, __int64 a2, __int64 a3, __int64 a4)
+        { 
+            __int128 v46[3]; // __m128 v46[3], 48 bytes total
+            int v47[44];
+            int v48[320];
+            memset(v46, 0, sizeof(v46)); // size of structure 2
+            memset_0(v47, 0, 0xA4ui64);
+            memset_0(v48, 0, 0x4F8ui64);
+            v47[0] = 164;   // size of structure 3
+            v48[0] = 1272;  // size of structure 4
+        }
+        #>
+
+        # Allocate unmanaged memory for PID, DPID, and DPID4
+        $PIDPtr   = New-IntPtr -Size 0x30  -WriteSizeAtZero
+        $DPIDPtr  = New-IntPtr -Size 0xB0  -InitialValue 0xA4
+        $DPID4Ptr = New-IntPtr -Size 0x500 -InitialValue 0x4F8
+
+        try {
+            try {
+                # Call the function with appropriate parameters
+                $result = $Global:PIDGENX::PidGenX2(
+                    # Most important Roles
+                    $key, $configPath,
+                    # Default value for MSPID, 03612 ?? 00000 ?
+                    # PIDGENX2 -> v26 = L"00000" // SPPCOMAPI, GetWindowsPKeyInfo -> L"03612"
+                    "00000",
+                    # Unknown1 / [Unknown2, Added in PidGenX2!]
+                    0,0,
+                    # Structs
+                    $PIDPtr, $DPIDPtr, $DPID4Ptr
+                )
+
+                #Dump-MemoryAddress -Pointer $PIDPtr   -Length 0x30  -FileName PIDPtr
+                #Dump-MemoryAddress -Pointer $DPIDPtr  -Length 0xB0  -FileName DPIDPtr
+                #Dump-MemoryAddress -Pointer $DPID4Ptr -Length 0x500 -FileName DPID4Ptr
+
+            } catch {
+                
+				<#
+                >>> .InnerException Class <<<
+                -----------------------------
+
+                ErrorCode      : -1979645951
+                Message        : Exception from HRESULT: 0x8A010001
+                Data           : {}
+                InnerException : 
+                TargetSite     : Int32 PidGenX(System.String, System.String, System.String, Int32, IntPtr, IntPtr, IntPtr)
+                StackTrace     :    at 0.PidGenX(String , String , String , Int32 , IntPtr , IntPtr , IntPtr )
+								                at CallSite.Target(Closure , CallSite , Object , String , String , String , Int32 , IntPtr , IntPtr , Object )
+                HelpLink       : 
+                Source         : 4
+                HResult        : -1979645951
+                #>
+
+                # Access the inner exception
+                $innerException = $_.Exception.InnerException
+
+                # Get the HResult directly
+                $HResult   = $innerException.HResult
+                $ErrorCode = $innerException.ErrorCode
+
+                # Map HResult to error text
+                $ErrorText = switch ($HResult) {
+                    -2147024809 { "The parameter is incorrect." }                   # PGX_MALFORMEDKEY
+                    -1979645695 { "Specified key is not valid." }                   # PGX_INVALIDKEY
+                    -1979645951 { "Specified key is valid but can't be verified." } # (Add appropriate message if needed)
+                    -2147024894 { "Can't find specified pkeyconfig file." }         # PGX_PKEYMISSING
+                    -2147024893 { "Specified pkeyconfig path does not exist." }     # (Already exists)
+                    -2147483633 { "Specified key is BlackListed." }                 # PGX_BLACKLISTEDKEY
+                        default { "Unhandled HResult" }                             # any other error
+                }
+
+                # Convert HResult to hexadecimal
+                $HResultHex = "0x{0:X8}" -f $HResult
+
+                throw "HRESULT: $ErrorText ($HResultHex)"
+            }
+
+            # Define offsets based on the DigitalProductId4 layout
+            $offsets = @{
+                AdvancedPid    = 8     # 128/2
+                ActivationId   = 136   # 128/2
+                EditionType    = 280   # 520/2
+                EditionId      = 888   # 128/2
+                KeyType        = 1016  # 128/2
+                EULA           = 1144  # 128/2
+            }
+
+            # Function to read WCHAR arrays
+            function Read-WCHARArray {
+                param (
+                    [IntPtr]$ptr,
+                    [int]$size
+                )
+                $bytes = New-Object byte[] ($size * 2)  # Each WCHAR is 2 bytes
+                [Marshal]::Copy($ptr, $bytes, 0, $bytes.Length)
+                return [Encoding]::Unicode.GetString($bytes).TrimEnd([char]0)
+            }
+
+            # Initilize results value
+            $results = @()
+
+            # Extract KeyGroup value from DigitalProductId3
+            $keyGroupOffset = 32
+            $keyGroup = [UInt32][Marshal]::ReadInt32([IntPtr]::Add($DPIDPtr, $keyGroupOffset))
+
+            if ($keyGroup) {
+                
+                #V2
+				try {
+                    $ProductDescription = $KeysText[[INT]$keyGroup]
+                }
+                catch {}
+
+                
+                #V1
+                if (-not $ProductDescription) {
+                  $list = GenerateConfigList -pkeyconfig $configPath -SkipKey $true -SkipKeyRange $true
+                  $data = $list | ? RefGroupId -eq $keyGroup
+                  if ($data -and (-not [STRING]::IsNullOrWhiteSpace($data.ProductDescription))) {
+                    $ProductDescription = $data.ProductDescription
+            }}}
+
+            $pidString = [marshal]::PtrToStringUni($pidPtr, 0x30/2)
+            foreach ($key in $offsets.Keys) {
+                $offset = $offsets[$key]
+                $size = if ($key -eq "EditionType") { (520/2) } else { (128/2) }
+                $value = if ($key -eq "IsUpgrade") { [Marshal]::ReadByte([IntPtr]::Add($DPID4Ptr, $offset)) } else { Read-WCHARArray ([IntPtr]::Add($DPID4Ptr, $offset)) $size }
+                
+				switch ($key) 
+                {
+                  'EULA'         {$EULA=$value}
+				  'KeyType'      {$KeyType=$value}
+				  'EditionId'    {$EditionId=$value}
+				  'AdvancedPid'  {$AdvancedPid=$value}
+                  'EditionType'  {$EditionType=$value}
+				  'ActivationId' {$ActivationId=$value}
+                }
+            }
+            
+          # $results += @{ Property = "KeyGroup"; Value = $keyGroup }
+            $results += @{ Property = "EditionType"; Value = $EditionType }
+            $results += @{ Property = "EditionId"; Value = $EditionId }
+            $results += @{ Property = "KeyType"; Value = $KeyType }
+            $results += @{ Property = "ProductID"; Value = $pidString }
+            $results += @{ Property = "ActivationId"; Value = $ActivationId }
+            $results += @{ Property = "AdvancedPid"; Value = $AdvancedPid }
+            $results += @{ Property = "Description"; Value = $ProductDescription }
+
+            return $results
+        } finally {
+            [Marshal]::FreeHGlobal($PIDPtr)
+            [Marshal]::FreeHGlobal($DPIDPtr)
+            [Marshal]::FreeHGlobal($DPID4Ptr)
+        }
+    } catch {
+        return @(
+            @{ Property = "Error"; Value = "$($_.Exception.Message)" }
+        )
+    }
+}
+function Lookup-ProductKey {
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$ProductKey,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Consume
+    )
+
+    $results = @()
+    foreach ($key in $ProductKey) {
+        # Validate product key format and ensure exactly one 'N'
+        if (!($key -match '^\w{5}(-\w{5}){4}$' -and
+              ($key.IndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -eq
+               $key.LastIndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -and
+               $key.IndexOf("n",[StringComparison]::InvariantCultureIgnoreCase) -ge 0))) {
+            Write-Warning "Product key $key is either not in the correct 5X5 format or does not contain exactly one 'N.'"
+            continue
+        }
+
+        $pkeyInfo = $null
+        $pkey = $key.Substring(0,29)
+
+        $paths = @(
+            "C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms",
+            "C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig-csvlk.xrm-ms",
+            "C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig-downlevel.xrm-ms",
+            "C:\Program Files\Microsoft Office\root\Licenses16\pkeyconfig-office.xrm-ms"
+        )
+        foreach ($path in $paths) {
+            try {
+                $result = Check-ProductKey -key $pkey -configPath $path
+                if ($result.GetValue(1).Property -ne 'Error') {
+                    $pkeyInfo = $result
+                    break
+                }
+            } catch {}
+        }
+        if (!$pkeyInfo) {
+            continue
+        }
+        if ($pkeyInfo) {
+            $resultObject = if ($Consume) {
+                try {
+                    $SLActivateProduct = $null
+                    $SLActivateProduct = Consume-ProductKey -ProductKey $pkey
+                } catch {}
+        
+                [PSCustomObject]@{
+                    ProductKey        = $pkey
+                    BatchActivation   = Call-WebService -requestType 2 -extendedProductId $pkeyInfo.GetValue(5).Value
+                    SLCertifyProduct  = ((Validate-ProductKey -ProductKey $pkey) -split "`r?`n" | Select-Object -First 1).Trim()
+                    SLActivateProduct = ($SLActivateProduct -split "`r?`n" | Select-Object -First 1).Trim()
+                }
+            } else {
+                [PSCustomObject]@{
+                    ProductKey        = $pkey
+                    BatchActivation   = Call-WebService -requestType 2 -extendedProductId $pkeyInfo.GetValue(5).Value
+                    SLCertifyProduct  = ((Validate-ProductKey -ProductKey $pkey) -split "`r?`n" | Select-Object -First 1).Trim()
+                }
+            }
+            $results += $resultObject
+            Start-sleep -Milliseconds 500
+        }
+    }
+    return $results
 }
 
 # oHook part -->
