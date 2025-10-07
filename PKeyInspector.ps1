@@ -25610,10 +25610,17 @@ Function ValidateForm {
     $txtCdKey.Font = $font
     $txtCdKey.ScrollBars = 'Vertical'
     $txtCdKey.Text = @"
-XQ8WW-N6WGD-67K88-74XDH-RGG2T
-GD4TT-HKNR7-PT36K-FF64G-PDQCT
-7F6DW-3NH9Q-H46WY-8VTXC-MP46G
-DH9CD-TKNQH-W3H7G-GD6JT-9K3CT
+    Latest LTSC 2021 KEY activation key sharing
+
+    Win 2021 RTM EnterpriseSN Volume:MAK
+
+    XQ8WW-N6WGD-67K88-74XDH-RGG2T
+
+    GD4TT-HKNR7-PT36K-FF64G-PDQCT
+
+    7F6DW-3NH9Q-H46WY-8VTXC-MP46G
+
+    DH9CD-TKNQH-W3H7G-GD6JT-9K3CT
 "@
     $form.Controls.Add($txtCdKey)
 
@@ -25633,29 +25640,38 @@ DH9CD-TKNQH-W3H7G-GD6JT-9K3CT
     $btnValidate.Font = $font
     $btnValidate.Add_Click({
         $txtResult.Clear()
-        $CdKeys = $txtCdKey.Text -Split([Environment]::NewLine) | ? { ![string]::IsNullOrWhiteSpace($_) } | % { $_ -replace [char]0x3000 } | % { $_.Trim() }
+        $CdKeys = Extract-CdKeys $txtCdKey.Text
         if ($chkOption.Checked) {
             $lookUpInfo = Lookup-ProductKey -ProductKey $CdKeys -Consume
         } else {
             $lookUpInfo = Lookup-ProductKey -ProductKey $CdKeys
         }
         if ($lookUpInfo -ne $null) {
-            $lookUpInfo | % { 
-                $txtResult.AppendText(("ProductKey:           {0}" -f $_.ProductKey) + "`n")
+            $results = @()
+            $global:jsonContent = $null
+            $lookUpInfo | % {
+                $txtResult.AppendText(("ProductKey:         {0}" -f $_.ProductKey) + "`n")
                 $txtResult.AppendText(("BatchActivation:    {0}" -f $_.BatchActivation) + "`n")
                 $txtResult.AppendText(("SLCertifyProduct:   {0}" -f $_.SLCertifyProduct) + "`n")
                 if ($_.SLActivateProduct) {
                    $txtResult.AppendText(("SLActivateProduct: {0}" -f $_.SLActivateProduct) + "`n")
                 }
                 $txtResult.AppendText("`n") 
+                $results += [PSCustomObject]@{
+                    ProductKey        = $_.ProductKey
+                    BatchActivation   = $_.BatchActivation
+                    SLCertifyProduct  = $_.SLCertifyProduct
+                    SLActivateProduct = $_.SLActivateProduct
+                }
             }
+            $global:jsonContent = $results | ConvertTo-Json -Depth 5
         }
     })
     $form.Controls.Add($btnValidate)
 
     $btnClear = New-Object System.Windows.Forms.Button
     $btnClear.Text = "Clear"
-    $btnClear.Location = New-Object System.Drawing.Point(200, 560) 
+    $btnClear.Location = New-Object System.Drawing.Point(185, 560) 
     $btnClear.Size = New-Object System.Drawing.Size(150, 40)
     $btnClear.Font = $font
     $btnClear.Add_Click({
@@ -25664,9 +25680,24 @@ DH9CD-TKNQH-W3H7G-GD6JT-9K3CT
     })
     $form.Controls.Add($btnClear)
 
+    $CopyBtn = New-Object System.Windows.Forms.Button
+    $CopyBtn.Text = "Open In Notepad"
+    $CopyBtn.Location = New-Object System.Drawing.Point(350, 560) 
+    $CopyBtn.Size = New-Object System.Drawing.Size(150, 40)
+    $CopyBtn.Font = $font
+    $CopyBtn.Add_Click({
+        if ($global:jsonContent) {
+            $tempFilePath = "$env:windir\temp\json.txt"
+            $global:jsonContent | out-file $tempFilePath
+            notepad $tempFilePath
+            [System.Windows.Forms.Clipboard]::SetText($txtResult.Text)
+        }
+    })
+    $form.Controls.Add($CopyBtn)
+
     $chkOption = New-Object System.Windows.Forms.CheckBox
-    $chkOption.Text = "Consume Product Key"
-    $chkOption.Location = New-Object System.Drawing.Point(370, 560) 
+    $chkOption.Text = "Consume Key [API]"
+    $chkOption.Location = New-Object System.Drawing.Point(550, 560) 
     $chkOption.Size = New-Object System.Drawing.Size(300, 50) 
     $chkOption.Font = New-Object System.Drawing.Font('Segoe UI', 12) 
     $form.Controls.Add($chkOption)
