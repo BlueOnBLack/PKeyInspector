@@ -28103,17 +28103,18 @@ Function WMI_Form {
             return
         }
 
-        # Get licensing info based on ActConfigId
         try { 
-            # Added try/catch for robust error handling inside this function
             $licenseInfo = Get-LicenseInfo -ActConfigId $selectedSKU
-
-            # Now, populate the DataGrid with relevant info (using the correct variable name)
             $dataGridView.Rows.Clear()
+            $dataGridView.ReadOnly = $false
+            $iid = $licenseInfo.OfflineInstallationId
+            if ($iid) {
+                $iid = ($licenseInfo.OfflineInstallationId -replace '(.{7})', '$1-').TrimEnd('-')
+            }
 
-            # Define the key-value pairs in a hashtable for fields
             $fields = @{
-                'ActConfigId'                    = $licenseInfo.ActConfigId
+                'Installation Id'                 = $iid
+                'ActConfigId'                     = $licenseInfo.ActConfigId
                 'RefGroupId'                      = $licenseInfo.RefGroupId
                 'EditionId'                       = $licenseInfo.EditionId
                 'ProductKeyType'                  = $licenseInfo.ProductKeyType
