@@ -20008,15 +20008,17 @@ function Lookup-ProductKey {
         if ($pkeyInfo) {
             $resultObject = if ($Consume) {
                 try {
-                    $SLActivateProduct = $null
-                    $SLActivateProduct = Consume-ProductKey -ProductKey $pkey
-                } catch {}
+                    $SLActivateProduct = ((Consume-ProductKey -ProductKey $pkey) -split "`r?`n" | Select-Object -First 1).Trim()
+                } 
+                catch {
+                    $SLActivateProduct = "{License file not found. Failed to acquire URI and XML.}"
+                }
         
                 [PSCustomObject]@{
                     ProductKey        = $pkey
                     BatchActivation   = Call-WebService -requestType 2 -extendedProductId $pkeyInfo.GetValue(5).Value
                     SLCertifyProduct  = ((Validate-ProductKey -ProductKey $pkey) -split "`r?`n" | Select-Object -First 1).Trim()
-                    SLActivateProduct = ($SLActivateProduct -split "`r?`n" | Select-Object -First 1).Trim()
+                    SLActivateProduct = $SLActivateProduct
                 }
             } else {
                 [PSCustomObject]@{
