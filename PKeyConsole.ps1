@@ -22790,7 +22790,7 @@ switch ($choice) {
         Office_Online_Install
     }
     "7" {
-        Get-EditionTargetsFromMatrix -UpgradeFrom $true
+        Get-EditionTargetsFromMatrix -UpgradeFrom
     }    
 }
 # --> End
@@ -22990,7 +22990,7 @@ if ($AutoMode) {
                 }
                 "RunUpgrade" {
                     try {
-                        Get-EditionTargetsFromMatrix -UpgradeFrom $true
+                        Get-EditionTargetsFromMatrix -UpgradeFrom
                     }
                     catch {
                         Write-Warning "$($action.Name) Mode Fail"
