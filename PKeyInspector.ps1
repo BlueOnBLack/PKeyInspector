@@ -8476,7 +8476,7 @@ Write-Host
 function Check-AccountType {
     param (
        [Parameter(Mandatory)]
-       [ValidateSet("System","Administrator")]
+       [ValidateSet("System", "Administrator", "TokenElevation")]
        [string]$AccType
     )
 
@@ -8626,6 +8626,81 @@ function Check {
 
     return $isMember
 }
+function IsElavated {
+    if ([IntPtr]::Size -eq 8) {
+        # 64-bit sizes and layout
+        $clientIdSize = 16
+        $objectAttrSize = 48
+    } else {
+        # 32-bit sizes and layout (WOW64)
+        $clientIdSize = 8
+        $objectAttrSize = 24
+    }
+    $hproc  = [IntPtr]::Zero
+    $procID = [TOKEN]::GetCurrentProcessId()
+    $clientIdPtr   = [marshal]::AllocHGlobal($clientIdSize)
+    $attributesPtr = [marshal]::AllocHGlobal($objectAttrSize)
+    [TOKEN]::RtlZeroMemory($clientIdPtr, [Uintptr]::new($clientIdSize))
+    [TOKEN]::RtlZeroMemory($attributesPtr, [Uintptr]::new($objectAttrSize))
+    [marshal]::WriteInt32($attributesPtr, 0x0, $objectAttrSize)
+    if ([IntPtr]::Size -eq 8) {
+        [Marshal]::WriteInt64($clientIdPtr, 0, [Int64]$procID)
+    }
+    else {
+        [Marshal]::WriteInt32($clientIdPtr, 0x0, $procID)
+    }
+    try {
+        if (0 -ne [TOKEN]::NtOpenProcess(
+            [ref]$hproc, 0x0400, $attributesPtr, $clientIdPtr)) {
+                throw "NtOpenProcess fail."
+        }
+    }
+    finally {
+        @($clientIdPtr, $attributesPtr) | % {[Marshal]::FreeHGlobal($_)}
+    }
+
+    $hToken = [IntPtr]::Zero
+    if (0 -ne [TOKEN]::NtOpenProcessToken(
+        $hproc, 0x00000008, [ref]$hToken)) {
+            throw "NtOpenProcessToken fail."
+    }
+    try {
+        # enum TOKEN_INFORMATION_CLASS
+        # https://ntdoc.m417z.com/token_information_class
+        $TokenElevation, $TokenElevationType = [IntPtr]0, [IntPtr]0
+
+        # // q: TOKEN_ELEVATION // 20
+        [UInt32]$ReturnLength = 0
+        $TokenElevation = [Marshal]::AllocHGlobal(4)
+        [marshal]::WriteInt32($TokenElevation,0x0, 0x0)
+        if (0 -ne [TOKEN]::NtQueryInformationToken(
+            $hToken,20,$TokenElevation, 4, [ref]$ReturnLength)) {
+                throw "NtQueryInformationToken fail."
+        }
+
+        # // q: TOKEN_ELEVATION_TYPE // 18
+        [UInt32]$ReturnLength = 0
+        $TokenElevationType = [Marshal]::AllocHGlobal(4)
+        [marshal]::WriteInt32($TokenElevationType,0x0, 0x0)
+        if (0 -ne [TOKEN]::NtQueryInformationToken(
+            $hToken,18,$TokenElevationType, 4, [ref]$ReturnLength)) {
+                throw "NtQueryInformationToken fail."
+        }
+
+        $ElevationStatus = [Marshal]::ReadInt32($TokenElevation, 0x0)
+        $ElevationType   = [Marshal]::ReadInt32($TokenElevationType, 0x0)
+        return ($ElevationType -eq 2 -or $ElevationStatus -gt 0)
+    }
+    finally {
+        if ($TokenElevation -ne [IntPtr]0) {
+            [marshal]::FreeHGlobal($TokenElevation)
+        }
+        if ($TokenElevationType -ne [IntPtr]0) {
+            [marshal]::FreeHGlobal($TokenElevationType)
+        }
+        @($hproc, $hToken) | % { [TOKEN]::NtClose($_) | Out-Null }
+    }
+}
   
   #SECURITY_NT_AUTHORITY (S-1-5)
   $isMember = $false
@@ -8641,6 +8716,9 @@ function Check {
         "Administrator" {
             # S-1-5-[32]-[544] // @([1],Count,0,0,0,0,0,[5] && 32,544)
             $isMember = Check -pSid $pSid -Subs @(32, 544) -Type Group
+        }
+        "TokenElevation" {
+            $isMember = IsElavated
         }
     }
   }
@@ -10115,7 +10193,9 @@ Function Obtain-UserToken {
         [String] $UserName,
         [String] $Password,
         [String] $Domain,
-        [switch] $loadProfile
+        [Int32]  $LogonType = 0x02,
+        [Int32]  $TokenType = 0x01,
+        [switch] $LoadProfile
     )
 
     try {
@@ -10173,8 +10253,8 @@ Function Obtain-UserToken {
             -Return bool `
             -Values @(
                 $UserNamePtr, $DomainPtr, $PasswordPtr,
-                0x02, # 0x02, 0x03, 0x07, 0x08
-                0x00, # LOGON32_PROVIDER_DEFAULT
+                $LogonType, # 0x02, 0x03, 0x07, 0x08
+                0x00,       # LOGON32_PROVIDER_DEFAULT
                 [IntPtr]0, ([ref]$phToken), [IntPtr]0,
                 [IntPtr]0, [IntPtr]0, [IntPtr]0))) {
                     throw "LogonUserExExW Failure .!"
@@ -10195,7 +10275,7 @@ Function Obtain-UserToken {
                 0xF01FF,         # DesiredAccess: all rights needed
                 [IntPtr]0,       # ObjectAttributes
                 0x02,            # SECURITY_IMPERSONATION
-                0x01,            # TOKEN_PRIMARY
+                $TokenType,      # TOKEN_PRIMARY
                 ([ref]$hToken)   # New token handle
             )
 
@@ -10204,7 +10284,7 @@ Function Obtain-UserToken {
             throw "Failed to Call NtDuplicateToken."
         }
 
-        if (!$loadProfile) {
+        if (!$LoadProfile) {
             return $hToken
         }
 
@@ -10228,9 +10308,9 @@ Function Obtain-UserToken {
 Function Process-UserToken {
     param (
         [PSObject]$Params = $null,
-        [IntPtr]$hToken = [IntPtr]0
+        [IntPtr]$hToken = [IntPtr]0,
+        [switch]$UseCurrent
     )
-
     try {
         $Module = [AppDomain]::CurrentDomain.GetAssemblies()| ? { $_.ManifestModule.ScopeName -eq "Token" } | select -Last 1
         $Token = $Module.GetTypes()[0]
@@ -10242,52 +10322,72 @@ Function Process-UserToken {
             @('OpenWindowStationW',           'User32.dll',   [intptr], @([string], [Int], [Int])),
             @('GetProcessWindowStation',      'User32.dll',   [intptr], @()),
             @('SetProcessWindowStation',      'User32.dll',   [bool],   @([IntPtr])),
+            @('GetThreadDesktop',             'User32.dll',   [intptr], @([int])),
             @('OpenDesktopW',                 'User32.dll',   [intptr], @([string], [int], [int], [int])),
             @('SetTokenInformation',          'advapi32.dll', [bool],   @([IntPtr], [Int], [IntPtr], [Int])),
+            @('GetCurrentThreadId',           'Kernel32.dll', [int],    @()),
             @('WTSGetActiveConsoleSessionId', 'Kernel32.dll', [int],    @())
         ) | % {
             $Module.DefinePInvokeMethod(($_[0]), ($_[1]), 22, 1, [Type]($_[2]), [Type[]]($_[3]), 1, 3).SetImplementationFlags(128) # Def` 128, fail-safe 0 
         }
         $Token = $Module.CreateType()
+        Start-Sleep 1
     }
 
     if ($Params -ne $null) {
-        Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hWinSta, $Params.LogonSid) | Out-Null
-        Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hDesktop, $Params.LogonSid) | Out-Null
+        if (!$UseCurrent) {
+            Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hWinSta, $Params.LogonSid)  | Out-Null
+            Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hDesktop, $Params.LogonSid) | Out-Null
+        }
         
-        Free-IntPtr -handle $Params.hToken     -Method NtHandle
-        Free-IntPtr -handle $Params.LogonSid   -Method NtHandle
-        Free-IntPtr -handle ($Params.hDesktop) -Method Desktop
-        Free-IntPtr -handle ($Params.hWinSta)  -Method WindowStation
+        Free-IntPtr -handle $Params.hToken    -Method NtHandle
+        Free-IntPtr -handle $Params.LogonSid  -Method NtHandle
+
+        if (!$UseCurrent) {
+            Free-IntPtr -handle ($Params.hDesktop) -Method Desktop
+            Free-IntPtr -handle ($Params.hWinSta)  -Method WindowStation
+        }
     }
     elseif ($hToken -ne [IntPtr]::Zero) {
         $hDesktop, $hWinSta = [IntPtr]0, [IntPtr]0
         $activeSessionIdPtr, $LogonSid = [IntPtr]0, [IntPtr]0
-        $hWinSta = $Token::OpenWindowStationW("winsta0", 0x00, (0x00020000 -bor 0x00040000L))
-        if ($hWinSta -eq [IntPtr]::Zero) {
-            throw "OpenWindowStationW failed .!"
-        }
 
-        $WinstaOld = $Token::GetProcessWindowStation()
-        if (!($Token::SetProcessWindowStation($hWinSta))) {
-            throw "SetProcessWindowStation failed .!"
+        if ($UseCurrent) {
+            $hWinSta = $Token::GetProcessWindowStation()
+            $hDesktop = $Token::GetThreadDesktop(
+                ($Token::GetCurrentThreadId()))
+        } else {
+            $hWinSta = $Token::OpenWindowStationW("winsta0", 0x00, (0x00020000 -bor 0x00040000L))
+            if ($hWinSta -eq [IntPtr]::Zero) {
+                throw "OpenWindowStationW failed .!"
+            }
+
+            $WinstaOld = $Token::GetProcessWindowStation()
+            if (!($Token::SetProcessWindowStation($hWinSta))) {
+                throw "SetProcessWindowStation failed .!"
+            }
+            $hDesktop = $Token::OpenDesktopW("default", 0x00, 0x00, (0x00020000 -bor 0x00040000 -bor 0x0080 -bor 0x0001))
+            $Token::SetProcessWindowStation($WinstaOld) | Out-Null
         }
-        $hDesktop = $Token::OpenDesktopW("default", 0x00, 0x00, (0x00020000 -bor 0x00040000 -bor 0x0080 -bor 0x0001))
-        $Token::SetProcessWindowStation($WinstaOld) | Out-Null
 
         ## Call helper DLL
-        if (!(Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function GetLogonSidFromToken -Return bool -Values @($hToken, ([ref]$LogonSid)))) {
+        if (!(Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function GetLogonSidFromToken -Return bool -Values @($hToken, ([ref]$LogonSid)))) {
             throw "GetLogonSidFromToken helper failed .!"
         }
 
         ## Call helper DLL
-        if (!(Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function AddAceToWindowStation -Return bool -Values @($hWinSta, $LogonSid))) {
+        if (!(Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function AddAceToWindowStation -Return bool -Values @($hWinSta, $LogonSid))) {
             throw "AddAceToWindowStation helper failed .!"
         }
 
         ## Call helper DLL
-        if (!(Invoke-UnmanagedMethod -Dll "$env:windir\temp\dacl.dll" -Function AddAceToDesktop -Return bool -Values @($hDesktop, $LogonSid))) {
+        if (!(Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function AddAceToDesktop -Return bool -Values @($hDesktop, $LogonSid))) {
             throw "AddAceToWindowStation helper failed .!"
+        }
+
+        ## Call helper DLL
+        if (!(Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function AddAceToProcess -Return bool -Values @(0x00, $LogonSid))) {
+            throw "AddAceToProcess helper failed .!"
         }
         
         ## any other case will fail
@@ -10597,11 +10697,21 @@ Invoke-Process `
     -UseDuplicatedToken
 
 # Could Fail to start from system/TI
+Write-Host 'Invoke-ProcessAsUser, As Logon/Imprsanate' -ForegroundColor Green
+Invoke-ProcessAsUser `
+    -Application cmd `
+    -CommandLine "/k whoami" `
+    -UserName Administrator `
+    -Password 0444 `
+    -Mode Hybrid `
+    -RunAsConsole
+
+# Could Fail to start from system/TI
 Write-Host 'Invoke-ProcessAsUser, As Logon' -ForegroundColor Green
 Invoke-ProcessAsUser `
     -Application cmd `
     -CommandLine "/k whoami" `
-    -UserName user `
+    -UserName Administrator `
     -Password 0444 `
     -Mode Logon `
     -RunAsConsole
@@ -10611,7 +10721,7 @@ Write-Host 'Invoke-ProcessAsUser, As Token' -ForegroundColor Green
 Invoke-ProcessAsUser `
     -Application cmd `
     -CommandLine "/k whoami" `
-    -UserName user `
+    -UserName Administrator `
     -Password 0444 `
     -Mode Token `
     -RunAsConsole
@@ -10621,7 +10731,7 @@ Write-Host 'Invoke-ProcessAsUser, As User' -ForegroundColor Green
 Invoke-ProcessAsUser `
     -Application cmd `
     -CommandLine "/k whoami" `
-    -UserName user `
+    -UserName Administrator `
     -Password 0444 `
     -Mode User `
     -RunAsConsole
@@ -10821,27 +10931,83 @@ Function Invoke-ProcessAsUser {
         [String] $Password,
         [String] $Domain,
 
-        [ValidateSet("Token", "Logon", "User")]
+        [Int32]  $LogonType  = 0x02,
+        [Int32]  $TokenType  = 0x01,
+        [Int32]  $LogonFlags = 0x01,
+
+        [ValidateSet("Token", "Logon", "User", "Hybrid")]
         [String] $Mode = "Logon",
 
         [Parameter(Mandatory=$false)]
-        [switch] $RunAsConsole
+        [switch] $RunAsConsole,
+
+        [Parameter(Mandatory=$false)]
+        [switch] $LoadProfile,
+
+        [Parameter(Mandatory=$false)]
+        [switch] $Impersonate
     )
 
-<#
-Custom Dll based on logue project.
+    <#
+    Custom Dll based on logue project.
 
-# Starting an Interactive Client Process in C++
-# https://learn.microsoft.com/en-us/previous-versions//aa379608(v=vs.85)?redirectedfrom=MSDN
+    @ Starting an Interactive Client Process in C++
+    # https://learn.microsoft.com/en-us/previous-versions//aa379608(v=vs.85)?redirectedfrom=MSDN
 
-# CreateProcessAsUser example
-# https://github.com/msmania/logue/blob/master/logue.cpp
-#>
+    @ CreateProcessAsUser example
+    # https://github.com/msmania/logue/blob/master/logue.cpp
+
+    @ RunAsHighIL.dpr
+    @ Spawn a high-integrity process from medium integrity via admin credentials (641 KiB on x64)
+    # https://github.com/diversenok/NtUtilsLibrary-Examples/tree/master?tab=readme-ov-file
+    # https://github.com/diversenok/NtUtilsLibrary-Examples/blob/master/RunAsHighIL/RunAsHighIL.dpr
+
+    @ https://x.com/splinter_code/status/1458054161472307204
+    * LogonUser (Network) -> Set token IL to Medium -> 
+    * Set Everyone FullControl on your current process DACL -> Impersonate -> 
+    * CreateProcessWithLogon (LOGON_NETCREDENTIALS_ONLY) and specify the admin credentials. 
+    * Enjoy High IL process with Interactive SID
+    #>
+
+    <#
+    try {
+        # Set the path to the DLL file
+        $dllPath = "C:\temp\dacl.dll"
+    
+        # Read the DLL file bytes
+        $dllBytes = [System.IO.File]::ReadAllBytes($dllPath)
+    
+        # Create a MemoryStream to write the compressed data
+        $memoryStream = New-Object System.IO.MemoryStream
+        $gzipStream = New-Object System.IO.Compression.GZipStream($memoryStream, [System.IO.Compression.CompressionMode]::Compress)
+    
+        # Write the DLL bytes into the GZipStream for compression
+        $gzipStream.Write($dllBytes, 0, $dllBytes.Length)
+        $gzipStream.Close()  # Close the GZipStream to finish compression
+
+        # Get the compressed bytes from the MemoryStream
+        $compressedBytes = $memoryStream.ToArray()
+    
+        # Convert the compressed bytes to a Base64 string
+        $base64String = [Convert]::ToBase64String($compressedBytes)
+
+        # Save the Base64 string to a text file on the Desktop
+        $desktopPath = [System.Environment]::GetFolderPath('Desktop')
+        $base64FilePath = Join-Path $desktopPath "dacl_compressed_base64.txt"
+    
+        Set-Content -Path $base64FilePath -Value $base64String
+
+        Write-Host "Base64 compressed string saved to $base64FilePath"
+    }
+    catch {
+        Write-Host "Error: $_"
+    }
+    #>
 
 try {
-  if (!([Io.file]::Exists("$env:windir\temp\dacl.dll"))) {
+  if (!([Io.file]::Exists("c:\temp\dacl.dll"))) {
 $base64String = @'
-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
+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
 '@
     $compressedBytes = [System.Convert]::FromBase64String($base64String)
     $memoryStream = New-Object System.IO.MemoryStream
@@ -10857,13 +11023,198 @@ H4sIAAAAAAAEAO07DXhTVZY3bdI/qCnQQCkIAVJbxHbSpmBLiyTS4KuTau2PFi2kIX2l0TSJyQsURtey
     $decompressedStream.Dispose()
     $memoryStream.Dispose()
     $outputMemoryStream.Dispose()
-    $dllPath = "$env:windir\temp\dacl.dll"
+    $dllPath = "c:\temp\dacl.dll"
+    New-Item -Path 'C:\' -Name 'temp' -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
     [System.IO.File]::WriteAllBytes($dllPath, $originalBytes)
   }
 }
 catch {
   throw "Can't load dacl.dll file .!"
 }
+
+    if (!([PSTypeName]'TokenHelper').Type) {
+        $tokenHelperCode = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+
+public class TokenHelper {
+ 
+   // Token Integrity Constants (RID values)
+    private const int TokenIntegrityLevel = 25;
+    private const int SECURITY_MANDATORY_UNTRUSTED_RID = 0x00000000;
+    private const int SECURITY_MANDATORY_LOW_RID = 0x00001000;
+    private const int SECURITY_MANDATORY_MEDIUM_RID = 0x00002000;
+    private const int SECURITY_MANDATORY_MEDIUM_PLUS_RID = 0x00003000;
+    private const int SECURITY_MANDATORY_HIGH_RID = 0x00004000;
+    private const int SECURITY_MANDATORY_SYSTEM_RID = 0x00005000;
+    private const int SECURITY_MANDATORY_PROTECTED_PROCESS_RID = 0x00006000;
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationToken(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    // Define NtSetInformationToken signature
+    [DllImport("ntdll.dll", SetLastError = true)]
+    public static extern int NtSetInformationToken(
+        IntPtr TokenHandle,
+        Int32 TokenInformationClass,
+        IntPtr TokenInformation,
+        uint TokenInformationLength
+    );
+
+    // Define the SID structure
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID
+    {
+        public byte Revision;
+        public byte SubAuthorityCount;
+        public SID_IDENTIFIER_AUTHORITY IdentifierAuthority;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        public int[] SubAuthority;
+    }
+
+    // Define the SID_IDENTIFIER_AUTHORITY structure
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID_IDENTIFIER_AUTHORITY
+    {
+        public byte Value0;
+        public byte Value1;
+        public byte Value2;
+        public byte Value3;
+        public byte Value4;
+        public byte Value5;
+    }
+
+    // Define SID_AND_ATTRIBUTES structure
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID_AND_ATTRIBUTES
+    {
+        public IntPtr Sid;
+        public uint Attributes;
+    }
+
+    // Query the token integrity level
+    public static int QueryTokenIntegrityLevel(IntPtr tokenHandle)
+    {
+        int returnLength = 0;
+        int status = NtQueryInformationToken(tokenHandle, TokenIntegrityLevel, IntPtr.Zero, 0, out returnLength);
+        IntPtr buffer = Marshal.AllocHGlobal(returnLength);
+
+        try
+        {
+            status = NtQueryInformationToken(tokenHandle, TokenIntegrityLevel, buffer, returnLength, out returnLength);
+            if (status == 0)  // Success
+            {
+                SID_AND_ATTRIBUTES sid = Marshal.PtrToStructure<SID_AND_ATTRIBUTES>(buffer);
+                return RtlxRidSid(sid.Sid);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+
+        return SECURITY_MANDATORY_UNTRUSTED_RID; // Default to Untrusted
+    }
+
+    // Extract the integrity level from the SID (last sub-authority)
+    static int RtlxRidSid(IntPtr sid)
+    {
+        int subAuthorityCount = Marshal.ReadByte(sid, 1); // Second byte in SID is SubAuthorityCount
+        IntPtr subAuthorityPtr = IntPtr.Add(sid, 2 + Marshal.SizeOf(typeof(SID_IDENTIFIER_AUTHORITY)));
+        int lastSubAuthority = Marshal.ReadInt32(IntPtr.Add(subAuthorityPtr, (subAuthorityCount - 1) * sizeof(int)));
+        return MapIntegrityLevel(lastSubAuthority);
+    }
+
+    // Map sub-authority to integrity level using a traditional switch statement
+    static int MapIntegrityLevel(int subAuthority)
+    {
+        switch (subAuthority)
+        {
+            case 0x00000000:
+                return SECURITY_MANDATORY_UNTRUSTED_RID;  // Untrusted
+            case 0x00001000:
+                return SECURITY_MANDATORY_LOW_RID;        // Low Integrity
+            case 0x00002000:
+                return SECURITY_MANDATORY_MEDIUM_RID;     // Medium Integrity
+            case 0x00003000:
+                return SECURITY_MANDATORY_MEDIUM_PLUS_RID; // Medium High Integrity
+            case 0x00004000:
+                return SECURITY_MANDATORY_HIGH_RID;       // High Integrity
+            case 0x00005000:
+                return SECURITY_MANDATORY_SYSTEM_RID;     // System Integrity
+            case 0x00006000:
+                return SECURITY_MANDATORY_PROTECTED_PROCESS_RID; // Protected Process
+            default:
+                return SECURITY_MANDATORY_UNTRUSTED_RID;  // Default to Untrusted if unknown
+        }
+    }
+
+    // Function to create a SID for the integrity level
+    public static Int32 CreateIntegritySid(int integrityLevel, ref IntPtr siaPointer)
+    {
+        IntPtr sidPointer = IntPtr.Zero;
+
+        try
+        {
+            // Prepare the SID structure
+            SID sid = new SID
+            {
+                Revision = 1,               // SID revision version
+                SubAuthorityCount = 1,      // We will use just one sub-authority (integrity level)
+                IdentifierAuthority = new SID_IDENTIFIER_AUTHORITY
+                {
+                    Value0 = 0,
+                    Value1 = 0,
+                    Value2 = 0,
+                    Value3 = 0,
+                    Value4 = 0,
+                    Value5 = 16             // S-1-16 (Integrity level authority)
+                },
+                SubAuthority = new int[8]   // Initialize the SubAuthority array with 8 elements
+                {
+                    integrityLevel,         // First element holds the integrity level (e.g., 0x00002000 for Medium)
+                    0, 0, 0, 0, 0, 0, 0     // Pad the rest with 0s
+                }
+            };
+
+            // Allocate memory for the SID structure
+            int sidSize = Marshal.SizeOf(sid);
+            sidPointer = Marshal.AllocHGlobal(sidSize);
+            Marshal.StructureToPtr(sid, sidPointer, false); // Marshal SID structure to the allocated memory
+
+            // Prepare the SID_AND_ATTRIBUTES structure
+            SID_AND_ATTRIBUTES mandatoryLabel = new SID_AND_ATTRIBUTES
+            {
+                Sid = sidPointer,          // SID pointer
+                Attributes = 0x00000040     // SE_GROUP_INTEGRITY_ENABLED (just an example attribute)
+            };
+
+            // Allocate memory for the SID_AND_ATTRIBUTES structure
+            int siaSize = Marshal.SizeOf(mandatoryLabel);
+            siaPointer = Marshal.AllocHGlobal(siaSize);
+            Marshal.StructureToPtr(mandatoryLabel, siaPointer, false); // Marshal SID_AND_ATTRIBUTES structure to the allocated memory
+
+            // Return the size of the SID_AND_ATTRIBUTES structure
+            return siaSize;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Error: " + ex.Message);
+        }
+
+        return 0; // Return 0 in case of failure
+    }
+}
+'@
+        Add-Type $tokenHelperCode -Language CSharp -ErrorAction Stop
+    }
     
     try {
         $hProcess, $hThread = [IntPtr]0, [IntPtr]0
@@ -10875,6 +11226,8 @@ catch {
         
         }
         
+        Ldr-LoadDll -dll "C:\Temp\dacl.dll" -dwFlags ALTERED_SEARCH | Out-Null
+        Ldr-LoadDll -dll "C:\Temp\dacl.dll" -dwFlags ALTERED_SEARCH | Out-Null
         $lpProcessInformation = New-IntPtr -Size $infoSize.ProcessInformationSize
         $lpStartupInfo = New-IntPtr -Size $infoSize.lpStartupInfoSize -WriteSizeAtZero
         $flags = if ($RunAsConsole) {
@@ -10891,21 +11244,109 @@ catch {
         $CommandLinePtr = [Marshal]::StringToHGlobalUni($FullCommandLine)
         $lpEnvironment = [IntPtr]::Zero
 
-        Adjust-TokenPrivileges -Privilege @("SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege", "SeImpersonatePrivilege", "SeTcbPrivilege") -SysCall | Out-Null
-        $hToken = Obtain-UserToken -UserName $UserName -Password $Password -Domain $Domain -loadProfile
-            
+        try {
+            Adjust-TokenPrivileges -Privilege SeDebugPrivilege | Out-Null
+        }
+        catch {}
+        if ($LoadProfile) {
+            $hToken = Obtain-UserToken -UserName $UserName -Password $Password -Domain $Domain -LogonType $LogonType -TokenType $TokenType -loadProfile
+        } else {
+            $hToken = Obtain-UserToken -UserName $UserName -Password $Password -Domain $Domain -LogonType $LogonType -TokenType $TokenType
+        }
+
         if (!(Invoke-UnmanagedMethod -Dll Userenv -Function CreateEnvironmentBlock -Return bool -Values @(([ref]$lpEnvironment), $hToken, $false))) {
             $lastError = [Marshal]::GetLastWin32Error()
-            throw "Failed to create environment block. Last error: $lastError"
+            Write-Warning "Failed to create environment block. Last error: $lastError"
         }
 
         $OffsetList = [PSCustomObject]@{
             WindowFlags = if ([IntPtr]::Size -eq 8) { 0xA4 } else { 0x68 }
-            ShowWindowFlags = if ([IntPtr]::Size -eq 8) { 0xA8 } else { 0x6C }
             lpDesktopOff = if ([IntPtr]::Size -gt 4) { 0x10 } else { 0x08 }
+            ShowWindowFlags = if ([IntPtr]::Size -eq 8) { 0xA8 } else { 0x6C }
         }
 
-        if ($Mode -eq 'Logon') {
+        if ($Mode -eq 'Hybrid') {
+            
+            ####################
+            # Hybrid Mode @@@@@@
+            ####################
+
+            $tokenHandle = [IntPtr]0;
+            [TokenHelper]::OpenProcessToken([TokenHelper]::GetCurrentProcess(), 0x0008, [ref]$tokenHandle)
+
+            $ProcessLevel = [TokenHelper]::QueryTokenIntegrityLevel($tokenHandle)
+            $hTokenLevel  = [TokenHelper]::QueryTokenIntegrityLevel($hToken)
+
+            $levelCheck = (
+                $ProcessLevel -ne $null -and $ProcessLevel -gt 0 -and (
+                    $hTokenLevel -ne $null -and $hTokenLevel -gt 0
+                )
+            )
+
+            if (!$levelCheck) {
+                throw "Fail to get level Check"
+            }
+
+            if ($ProcessLevel -ne $hTokenLevel) {
+                $TokenLength = 0;
+                $TokenInformation = [IntPtr]::Zero;
+                $TokenLength = [TokenHelper]::CreateIntegritySid($ProcessLevel, [ref]$TokenInformation);
+                if ($TokenInformation -ne 0) {
+                    [TokenHelper]::NtSetInformationToken($hToken, 25, $TokenInformation, $TokenLength);
+                    Free-IntPtr -handle ([marshal]::ReadIntPtr($TokenInformation, 0x0))
+                    Free-IntPtr -handle $TokenInformation
+                }
+
+                $ProcessLevel = [TokenHelper]::QueryTokenIntegrityLevel($tokenHandle)
+                $hTokenLevel  = [TokenHelper]::QueryTokenIntegrityLevel($hToken)
+                $levelCheck = (
+                    $ProcessLevel -ne $null -and $ProcessLevel -gt 0 -and (
+                        $hTokenLevel -ne $null -and $hTokenLevel -gt 0
+                    ) -and (
+                        $ProcessLevel -eq $hTokenLevel
+                    )
+                )
+                if (!$levelCheck) {
+                    throw "Fail to get level Check -or cant' reduce level check"
+                }
+            }
+
+            if (!(Invoke-UnmanagedMethod -Dll Advapi32 -Function ImpersonateLoggedOnUser -Return bool -Values @($hToken))) {
+                throw "ImpersonateLoggedOnUser failed.!"
+            }
+            
+            try {
+                Adjust-TokenPrivileges -Privilege SeDebugPrivilege | Out-Null
+            }
+            catch { }
+
+            # Prefere hToken for current User
+            $hInfo = Process-UserToken -hToken $hToken -UseCurrent
+
+            $UserNamePtr = [Marshal]::StringToHGlobalUni($UserName)
+            $PasswordPtr = if ([string]::IsNullOrEmpty($Password)) { [IntPtr]::Zero } else { [Marshal]::StringToHGlobalUni($Password) }
+            $DomainPtr   = if ([string]::IsNullOrEmpty($Domain)) { [IntPtr]::Zero } else { [Marshal]::StringToHGlobalUni($Domain) }
+
+            # Call internally to Advapi32->CreateProcessWithLogonCommonW->RPC call
+            $ret = Invoke-UnmanagedMethod -Dll Advapi32 -Function CreateProcessWithLogonW -CallingConvention StdCall -Return bool -CharSet Unicode -Values @(
+                $UserNamePtr, $DomainPtr, $PasswordPtr,
+                $LogonFlags,
+                $ApplicationPtr, $CommandLinePtr,
+                $flags, [Int64]0, "c:\", $lpStartupInfo, $lpProcessInformation
+            )
+
+            # Revert to your original, privileged context
+            Invoke-UnmanagedMethod -Dll Advapi32 -Function RevertToSelf -Return bool | Out-Null
+
+            # Clean Params laters
+            Process-UserToken -Params $hInfo -UseCurrent
+
+            ####################
+            # Hybrid Mode @@@@@@
+            ####################
+
+        } elseif ($Mode -eq 'Logon') {
+
             if (Check-AccountType -AccType System){
                 Write-Warning "Could fail under system Account.!"
                 #return $false
@@ -10917,10 +11358,11 @@ catch {
             # Call internally to Advapi32->CreateProcessWithLogonCommonW->RPC call
             $ret = Invoke-UnmanagedMethod -Dll Advapi32 -Function CreateProcessWithLogonW -CallingConvention StdCall -Return bool -CharSet Unicode -Values @(
                 $UserNamePtr, $DomainPtr, $PasswordPtr,
-                0x00000001,
+                $LogonFlags,
                 $ApplicationPtr, $CommandLinePtr,
                 $flags, $lpEnvironment, "c:\", $lpStartupInfo, $lpProcessInformation
             )
+
         } elseif ($Mode -eq 'Token') {
 
             # Prefere hToken for current User
@@ -19145,7 +19587,7 @@ function Activate-License([string]$desc, [string]$ver, [string]$prod, [string]$t
         return
     }
 
-    $ProductInfo = gwmi SoftwareLicensingProduct -ea 0 -Filter "ID='$tsactid'"
+    $ProductInfo = gwmi SoftwareLicensingProduct -ErrorAction SilentlyContinue -Filter "ID='$tsactid'"
     if (-not $ProductInfo) {
         Write-Warning "Product not found"
         return
@@ -19325,8 +19767,7 @@ function Create-SoapRequest {
         [string]$extendedProductId
     )
 
-    $activationRequestXml =
-@"
+    $activationRequestXml = @"
 <ActivationRequest xmlns="http://www.microsoft.com/DRM/SL/BatchActivationRequest/1.0">
   <VersionNumber>2.0</VersionNumber>
   <RequestType>$requestType</RequestType>
@@ -19625,7 +20066,6 @@ function Consume-ProductKey {
     $act_config_id = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $systime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
     $utctime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
-
     $requestXml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope
@@ -19712,7 +20152,6 @@ function Consume-ProductKey {
     </soap:Body>
 </soap:Envelope>
 "@
-
     try {
         $response = $null
         $webRequest = [System.Net.HttpWebRequest]::Create($LicenseURL)
