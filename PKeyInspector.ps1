@@ -5737,9 +5737,7 @@ Manage-UnicodeString -UnicodeStringPtr $unicodeStringPtr -Release
 #>
 function Init-NativeString {
     param (
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Value,
+        [string]$Value = "",
 
         [Parameter(Mandatory = $true)]
         [ValidateSet('Ansi', 'Unicode')]
@@ -5749,6 +5747,14 @@ function Init-NativeString {
         [Int32]$MaxLength = 0,
         [Int32]$BufferSize = 0
     )
+    if ([string]::IsNullOrEmpty($Value)) {
+        $blockSize = if ([IntPtr]::Size -gt 4) { 0x10 } else { 0x08 }
+        $stringPtr = New-IntPtr -Size $blockSize
+        $stringVal = New-IntPtr -Size 0x02
+        [marshal]::WriteInt16($stringPtr,  0x02, 0x02)
+        [marshal]::WriteIntPtr($stringPtr, [IntPtr]::Size, $stringVal)
+        return $stringPtr
+    }
 
      # Determine required byte length of the string in the specified encoding
     if ($Encoding -eq 'Ansi') {
@@ -5761,7 +5767,8 @@ function Init-NativeString {
         throw "BufferSize ($BufferSize) is smaller than the encoded string size ($requiredSize)."
     }
 
-    $stringPtr = New-IntPtr -Size 16
+    $blockSize = if ([IntPtr]::Size -gt 4) { 0x10 } else { 0x08 }
+    $stringPtr = New-IntPtr -Size $blockSize
 
     if ($Encoding -eq 'Ansi') {
         if ($Length -le 0) {
@@ -10187,14 +10194,255 @@ function Query-Process {
 
     return $results
 }
+function Lsa-UpdateInfo {
+    param (
+        [IntPtr]$StructPtr,      # Pointer to MSV1_0_INTERACTIVE_LOGON
+        [int]$Index,             # 0=Domain, 1=UserName, 2=Password
+        [string]$Value,          # The string to write
+        [ref]$StringPtr,         # [ref] pointer that moves forward
+        [pscustomobject]$OffsetMap
+    )
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        $unicodePtr = Init-NativeString -Encoding Unicode
+    } else {
+        $unicodePtr = Init-NativeString -Value $Value -Encoding Unicode
+    }
+
+    # Offset to the UNICODE_STRING field in the struct
+    $fieldOffset = [IntPtr]::Add($StructPtr, ($OffsetMap.Base + ($OffsetMap.BlockSize * $Index)))
+
+    # Copy UNICODE_STRING struct (Length, MaxLength, Buffer) into structure
+    $ntdll::RtlMoveMemory($fieldOffset, $unicodePtr, [UIntPtr]::new($OffsetMap.BlockSize))
+
+    # Get the actual string buffer from unicodePtr (UNICODE_STRING.Buffer)
+    $buffer = [Marshal]::ReadIntPtr($unicodePtr, [IntPtr]::Size)
+
+    # Copy the actual string data into the stringPtr buffer
+    $ntdll::RtlMoveMemory(
+        $StringPtr.Value,
+        $buffer,
+        [UIntPtr]::new((($Value.Length + 1) * 2))
+    )
+
+    # Write pointer to actual string into UNICODE_STRING.Buffer
+    [Marshal]::WriteIntPtr($fieldOffset, [IntPtr]::Size, $StringPtr.Value)
+
+    # Advance the string pointer
+    $StringPtr.Value = [IntPtr]::Add($StringPtr.Value, (($Value.Length + 1) * 2))
+
+    # Clean up native string
+    Free-NativeString -StringPtr $unicodePtr
+}
+Function Lsa-LogonUser {
+    param (
+        [ValidateNotNullOrEmpty()]
+        [string]$UserName,
+        [string]$Password = "",
+        [string]$Domain = ".",
+        [Int32]$LogonType = 0x02,
+        [Switch]$Logging
+    )
+
+    try {
+        $Module = [AppDomain]::CurrentDomain.GetAssemblies()| ? { $_.ManifestModule.ScopeName -eq "LSA" } | select -Last 1
+        $LSA = $Module.GetTypes()[0]
+    }
+    catch {
+        $Module = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("LSA", $False).DefineType("null")
+        @(
+            @('null', 'null', [int], @()), # place holder
+            @('RtlAllocateHeap',                'NTDLL.dll', [IntPtr],  @([IntPtr], [Int32], [UIntPtr])),
+            @('NtAllocateLocallyUniqueId',      'NTDLL.dll', [int32], @([Int64].MakeByRefType())),
+            @('LsaConnectUntrusted',            'SSPICLI.dll',  [int32], @([IntPtr].MakeByRefType())),
+            @('LsaDeregisterLogonProcess',      'SSPICLI.dll',  [int32], @([IntPtr])),
+            @('LsaLookupAuthenticationPackage', 'SSPICLI.dll',  [int32], @([IntPtr],[IntPtr], [UInt32].MakeByRefType()))
+        ) | % {
+            $Module.DefinePInvokeMethod(($_[0]), ($_[1]), 22, 1, [Type]($_[2]), [Type[]]($_[3]), 1, 3).SetImplementationFlags(128) # Def` 128, fail-safe 0 
+        }
+        $LSA = $Module.CreateType()
+    }
+
+    $AuthPackageMapping = [PSObject]@{
+        MSV1_0_PACKAGE_NAME       = 'MICROSOFT_AUTHENTICATION_PACKAGE_V1_0'
+        MICROSOFT_KERBEROS_NAME_A = 'Kerberos'
+        NEGOSSP_NAME_A            = 'Negotiate'
+        NTLMSP_NAME_A             = 'NTLM'
+    }
+    
+    # Handle from LSA
+    $hLsa = [IntPtr]::Zero;
+    $LSA::LsaConnectUntrusted([ref]$hLsa) | Out-Null
+    if ($LsaHandle -eq [IntPtr]::Zero) {
+        Write-warning 'LsaConnectUntrusted failed'
+        return [IntPtr]::Zero;
+    }
+        
+    try {
+        # [Second] parameter
+        $originName = Init-NativeString -Value "LocalApp" -Encoding Ansi
+
+        # [Third] parameter
+        [UInt32]$authPackageId = 0
+
+        $packageName = Init-NativeString -Value $AuthPackageMapping.NEGOSSP_NAME_A -Encoding Ansi
+        #$packageName = Init-NativeString -Value $AuthPackageMapping.MSV1_0_PACKAGE_NAME -Encoding Ansi
+        $status = $LSA::LsaLookupAuthenticationPackage(
+            $hLsa, $packageName, [ref]$authPackageId)
+
+        if ($status -ne 0) {
+            $StatusError = Parse-ErrorMessage -MessageId $status -Flags NTSTATUS
+            Write-warning "LsaLookupAuthenticationPackage failed with Code Error:"
+            Write-warning "$StatusError"
+            return [IntPtr]::Zero;
+        }
+
+        $offsetMap = [PSCustomObject ]@{
+            Base       = [IntPtr]::Size
+            BlockSize  = if ([IntPtr]::Size -gt 4) { 0x10 } else { 0x08 }
+            Length     = if ([IntPtr]::Size -gt 4) { 0x38 } else { 0x1C }
+        }
+        
+        $heap = (NtCurrentTeb -ProcessHeap)
+        $authInfo = $LSA::RtlAllocateHeap(
+            [IntPtr]$heap,
+            0x00000008,
+            [UIntPtr]::new(1024)
+        )
+        if (!$authInfo -or $authInfo -eq [IntPtr]::Zero) {
+            Write-warning 'HeapAlloc failed.'
+            return [IntPtr]::Zero;
+        } else {
+            $stringMap = [IntPtr]::Add($authInfo, $offsetMap.Length)
+        }
+
+        # MSV1_0_LOGON_SUBMIT_TYPE MessageType;
+        $MsV1_0InteractiveLogon = 0x02
+        [marshal]::WriteInt32($authInfo, 0x00, $MsV1_0InteractiveLogon)
+        # Domain, User, Password
+        Lsa-UpdateInfo -StructPtr $authInfo -Index 0 -Value $Domain   -StringPtr ([ref]$stringMap) -OffsetMap $offsetMap
+        Lsa-UpdateInfo -StructPtr $authInfo -Index 1 -Value $Username -StringPtr ([ref]$stringMap) -OffsetMap $offsetMap
+        Lsa-UpdateInfo -StructPtr $authInfo -Index 2 -Value $Password -StringPtr ([ref]$stringMap) -OffsetMap $offsetMap
+
+        ($Domain, $Username, $Password) |  % `
+            -Begin {
+                $authInfoSize = $offsetMap.Length
+            } `
+            -Process {
+                if ($_.Length -ge 0) {
+                    $authInfoSize += (($_.Length+1)*2)
+            }} `
+            -End {
+                # just to make sure.
+                $authInfoSize += 0x02
+            }
+
+        $heap = (NtCurrentTeb -ProcessHeap)
+        $tokenSource = $LSA::RtlAllocateHeap(
+            [IntPtr]$heap,
+            0x00000008,
+            [UIntPtr]::new(16)
+        )
+        $sourceName = [System.Text.Encoding]::ASCII.GetBytes("UserLog0")
+        [Int64]$Luid = 0; $status = $LSA::NtAllocateLocallyUniqueId([ref]$Luid)
+        [Marshal]::Copy($sourceName, 0, $tokenSource, $sourceName.Length)
+        [Marshal]::WriteInt64($tokenSource, 0x08, $Luid)
+
+        # Buffer Allocations
+        $Buffer       = New-IntPtr -Size ([IntPtr]::Size)
+        $BufferLength = New-IntPtr -Size ([IntPtr]::Size)
+        $hLogonId     = New-IntPtr -Size ([IntPtr]::Size)
+        $Token        = New-IntPtr -Size ([IntPtr]::Size)
+        $hQuotas      = New-IntPtr -Size (([IntPtr]::Size)*6)
+        $hSubStatus   = New-IntPtr -Size ([IntPtr]::Size)
+
+        $Status = Invoke-UnmanagedMethod SSPICLI.dll LsaLogonUser -Values @(
+            $hLsa, $originName, $LogonType,            # 1-3
+            $authPackageId, $authInfo, $authInfoSize,  # 4-6
+            [IntPtr]::Zero, $tokenSource,              # 7-8
+            $Buffer,                                   # 9. ProfileBuffer
+            $BufferLength,                             # 10. ProfileBufferLength
+            $hLogonId,                                 # 11. LogonId
+            $Token,                                    # 12. Token (Correct)
+            $hQuotas,                                  # 13. Quotas
+            $hSubStatus                                # 14. SubStatus
+        )
+
+        if ($Logging) {
+            Write-Host "`n=== DEBUG: Variables passed to LsaLogonUser ===" -ForegroundColor Cyan
+            Write-Host "`n[authInfo]" -ForegroundColor Yellow
+            Write-Host "Pointer: $authInfo"
+            Write-Host "Size: $authInfoSize"
+
+            For ($i = 0; $i -lt 3; $i++) {
+                $offset = [IntPtr]::Add($authInfo, $offsetMap.Base + ($i * $offsetMap.BlockSize))
+                $length     = [Marshal]::ReadInt16($offset, 0)
+                $maxLength  = [Marshal]::ReadInt16($offset, 2)
+                $bufferPtr  = [Marshal]::ReadIntPtr($offset, [IntPtr]::Size)
+                $bufferStr  = [Marshal]::PtrToStringUni($bufferPtr)
+                Write-Host "Field [$i] | Length: $length, MaxLength: $maxLength, Ptr: $bufferPtr, Value: '$bufferStr'" -ForegroundColor Green
+            }
+
+            Write-Host "`n[originName]" -ForegroundColor Yellow
+            $originBufferPtr = [Marshal]::ReadIntPtr($originName, [IntPtr]::Size)  # Offset to Buffer field
+            $originNameStr = [System.Runtime.InteropServices.Marshal]::PtrToStringAnsi($originBufferPtr)
+            Write-Host "Pointer: $originName"
+            Write-Host "Buffer: $originBufferPtr"
+            Write-Host "Value: $originNameStr"
+
+            Write-Host "`n[Authentication Package]" -ForegroundColor Yellow
+            Write-Host "ID: $authPackageId"
+
+            Write-Host "`n[Token Source]" -ForegroundColor Yellow
+            $sourceBytes = New-Object byte[] 8
+            [System.Runtime.InteropServices.Marshal]::Copy($tokenSource, $sourceBytes, 0, 8)
+            $sourceNameStr = [System.Text.Encoding]::ASCII.GetString($sourceBytes)
+            $luid = [System.Runtime.InteropServices.Marshal]::ReadInt64($tokenSource, 8)
+            Write-Host "Ptr: $tokenSource"
+            Write-Host "Name: $sourceNameStr"
+            Write-Host "LUID: $luid"
+            Write-Host "`n=========================================================`n" -ForegroundColor Cyan
+            return
+        }
+
+        if ($Status -ne 0x00) {
+            $NtStatusMSG = Parse-ErrorMessage -MessageId $Status -Flags NTSTATUS
+            Write-Warning "LsaLogonUser return with error code:"
+            Write-Warning "$NtStatusMSG"
+            return [IntPtr]::Zero
+        }
+
+        $hToken = [Marshal]::ReadIntPtr($token)
+        return $hToken
+    }
+    finally {
+        $LSA::LsaDeregisterLogonProcess($hLsa) | Out-Null
+        Free-IntPtr -handle $originName   -Method STRING
+        Free-IntPtr -handle $packageName  -Method STRING
+        Free-IntPtr -handle $authInfo     -Method Heap
+        Free-IntPtr -handle $tokenSource  -Method Heap
+        Free-IntPtr -handle $Buffer       -Method Auto
+        Free-IntPtr -handle $BufferLength -Method Auto
+        Free-IntPtr -handle $hLogonId     -Method Auto
+        Free-IntPtr -handle $Token        -Method Auto
+        Free-IntPtr -handle $hQuotas      -Method Auto
+        Free-IntPtr -handle $hSubStatus   -Method Auto
+    }
+}
 Function Obtain-UserToken {
     param (
         [ValidateNotNullOrEmpty()]
         [String] $UserName,
+
         [String] $Password,
         [String] $Domain,
+
         [Int32]  $LogonType = 0x02,
         [Int32]  $TokenType = 0x01,
+
+        [ValidateSet("LogonUserExExW", "LsaLogonUser")]
+        [String] $Method = "LogonUserExExW",
+
         [switch] $LoadProfile
     )
 
@@ -10231,60 +10479,71 @@ Function Obtain-UserToken {
           The user represented by the token must have read and execute access to the application
           specified by the lpApplicationName or the lpCommandLine parameter.
         #>
-
-        <#
-        # Work, but actualy fail, so, no thank you
-        if (!($USER::LogonUserExExW(
-            $UserNamePtr, $DomainPtr, $PasswordPtr,
-            0x02, # 0x02, 0x03, 0x07, 0x08
-            0x00, # LOGON32_PROVIDER_DEFAULT
-            [IntPtr]0, ([ref]$phToken), [IntPtr]0,
-            [IntPtr]0, [IntPtr]0, [IntPtr]0))) {
-                throw "LogonUserExExW Failure .!"
+        if ($Method -eq "LogonUserExExW") {
+            if (!(Invoke-UnmanagedMethod `
+                -Dll sspicli `
+                -Function LogonUserExExW `
+                -CallingConvention StdCall `
+                -CharSet Unicode `
+                -Return bool `
+                -Values @(
+                    $UserNamePtr, $DomainPtr, $PasswordPtr,
+                    $LogonType, # 0x02, 0x03, 0x07, 0x08
+                    0x00,       # LOGON32_PROVIDER_DEFAULT
+                    [IntPtr]0, ([ref]$phToken), [IntPtr]0,
+                    [IntPtr]0, [IntPtr]0, [IntPtr]0))) {
+                        throw "LogonUserExExW Failure .!"
+                    }
+            
+            # according to MS article, this is primary Token
+            # we can return this --> $phToken, Directly.!
+            # return $phToken
+        } 
+        elseif ($Method -eq "LsaLogonUser") {           
+            [Intptr]$phToken = Lsa-LogonUser -UserName $UserName -Password $Password -Domain $Domain -LogonType $LogonType
+            if (!(IsValid-IntPtr $phToken)) {
+                throw "LsaLogonUser Failure .!"
             }
-        #>
-
-        #<#
-        if (!(Invoke-UnmanagedMethod `
-            -Dll sspicli `
-            -Function LogonUserExExW `
-            -CallingConvention StdCall `
-            -CharSet Unicode `
-            -Return bool `
-            -Values @(
-                $UserNamePtr, $DomainPtr, $PasswordPtr,
-                $LogonType, # 0x02, 0x03, 0x07, 0x08
-                0x00,       # LOGON32_PROVIDER_DEFAULT
-                [IntPtr]0, ([ref]$phToken), [IntPtr]0,
-                [IntPtr]0, [IntPtr]0, [IntPtr]0))) {
-                    throw "LogonUserExExW Failure .!"
-                }
-        #>
-
-        # according to MS article, this is primary Token
-        # we can return this --> $phToken, Directly.!
-        # return $phToken
-
-        #<#
+        }
 
         # Duplicate token to Primary
         $hToken = [IntPtr]0
         
         $ret = $USER::NtDuplicateToken(
-                $phToken,        # Existing token
-                0xF01FF,         # DesiredAccess: all rights needed
-                [IntPtr]0,       # ObjectAttributes
-                0x02,            # SECURITY_IMPERSONATION
-                $TokenType,      # TOKEN_PRIMARY
-                ([ref]$hToken)   # New token handle
-            )
+            $phToken,      # [in] Existing Token Handle
+            0xF01FF,       # [in] DesiredAccess (TOKEN_ALL_ACCESS)
+            [IntPtr]0,     # [in] ObjectAttributes (NULL)
+            0x00,          # [in] BOOLEAN EffectiveOnly (FALSE)
+            0x01,          # [in] TOKEN_TYPE (TokenPrimary)
+            ([ref]$hToken) # [out] New Token Handle
+        )
 
         if ($ret -ne 0) {
-            Free-IntPtr -handle $hToken -Method NtHandle
-            throw "Failed to Call NtDuplicateToken."
+            $MinimumFlags = 0x0002 -bor 0x0004 -and 0x0008
+            $ret = $USER::NtDuplicateToken(
+                $phToken,        # [in] Existing Token Handle
+                $MinimumFlags,   # [in] DesiredAccess (TOKEN_ALL_ACCESS)
+                [IntPtr]0,       # [in] ObjectAttributes (NULL)
+                0x00,            # [in] BOOLEAN EffectiveOnly (FALSE)
+                0x01,            # [in] TOKEN_TYPE (TokenPrimary)
+                ([ref]$hToken)   # [out] New Token Handle
+            )
+
+            if ($ret -ne 0) {
+                #Free-IntPtr -handle $hToken -Method NtHandle
+                $hToken = [IntPtr]$phToken
+                $retMsg = Parse-ErrorMessage -MessageId $ret -Flags NTSTATUS
+                
+                Write-Host
+                Write-Warning "Failed to Call NtDuplicateToken."
+                Write-Warning $retMsg
+            }
         }
 
         if (!$LoadProfile) {
+            if ($phToken -ne $hToken) {
+              Free-IntPtr -handle $phToken -Method NtHandle
+            }
             return $hToken
         }
 
@@ -10297,7 +10556,9 @@ Function Obtain-UserToken {
             }
 
         Free-IntPtr -handle $sessionIdPtr
-        Free-IntPtr -handle $phToken -Method NtHandle
+        if ($phToken -ne $hToken) {
+          Free-IntPtr -handle $phToken -Method NtHandle
+        }
         return $hToken
     }
     finally {
@@ -10938,6 +11199,9 @@ Function Invoke-ProcessAsUser {
         [ValidateSet("Token", "Logon", "User", "Hybrid")]
         [String] $Mode = "Logon",
 
+        [ValidateSet("LogonUserExExW", "LsaLogonUser")]
+        [String] $Method = "LogonUserExExW",
+
         [Parameter(Mandatory=$false)]
         [switch] $RunAsConsole,
 
@@ -11249,9 +11513,22 @@ public class TokenHelper {
         }
         catch {}
         if ($LoadProfile) {
-            $hToken = Obtain-UserToken -UserName $UserName -Password $Password -Domain $Domain -LogonType $LogonType -TokenType $TokenType -loadProfile
+            $hToken = Obtain-UserToken `
+                -UserName $UserName `
+                -Password $Password `
+                -Domain $Domain `
+                -LogonType $LogonType `
+                -TokenType $TokenType `
+                -Method $Method `
+                -loadProfile
         } else {
-            $hToken = Obtain-UserToken -UserName $UserName -Password $Password -Domain $Domain -LogonType $LogonType -TokenType $TokenType
+            $hToken = Obtain-UserToken `
+                -UserName $UserName `
+                -Password $Password `
+                -Domain $Domain `
+                -LogonType $LogonType `
+                -TokenType $TokenType `
+                -Method $Method 
         }
 
         if (!(Invoke-UnmanagedMethod -Dll Userenv -Function CreateEnvironmentBlock -Return bool -Values @(([ref]$lpEnvironment), $hToken, $false))) {
@@ -11271,15 +11548,15 @@ public class TokenHelper {
             # Hybrid Mode @@@@@@
             ####################
 
-            $tokenHandle = [IntPtr]0;
-            [TokenHelper]::OpenProcessToken([TokenHelper]::GetCurrentProcess(), 0x0008, [ref]$tokenHandle)
+            $tokenHandle = [IntPtr]::Zero;
+            [TokenHelper]::OpenProcessToken([TokenHelper]::GetCurrentProcess(), 0x0008, [ref]$tokenHandle) | Out-Null
 
             $ProcessLevel = [TokenHelper]::QueryTokenIntegrityLevel($tokenHandle)
             $hTokenLevel  = [TokenHelper]::QueryTokenIntegrityLevel($hToken)
 
             $levelCheck = (
-                $ProcessLevel -ne $null -and $ProcessLevel -gt 0 -and (
-                    $hTokenLevel -ne $null -and $hTokenLevel -gt 0
+                $ProcessLevel -ne $null -and $ProcessLevel -ge 0 -and (
+                    $hTokenLevel -ne $null -and $hTokenLevel -ge 0
                 )
             )
 
@@ -11292,7 +11569,7 @@ public class TokenHelper {
                 $TokenInformation = [IntPtr]::Zero;
                 $TokenLength = [TokenHelper]::CreateIntegritySid($ProcessLevel, [ref]$TokenInformation);
                 if ($TokenInformation -ne 0) {
-                    [TokenHelper]::NtSetInformationToken($hToken, 25, $TokenInformation, $TokenLength);
+                    [TokenHelper]::NtSetInformationToken($hToken, 25, $TokenInformation, $TokenLength) | Out-Null
                     Free-IntPtr -handle ([marshal]::ReadIntPtr($TokenInformation, 0x0))
                     Free-IntPtr -handle $TokenInformation
                 }
@@ -11300,18 +11577,19 @@ public class TokenHelper {
                 $ProcessLevel = [TokenHelper]::QueryTokenIntegrityLevel($tokenHandle)
                 $hTokenLevel  = [TokenHelper]::QueryTokenIntegrityLevel($hToken)
                 $levelCheck = (
-                    $ProcessLevel -ne $null -and $ProcessLevel -gt 0 -and (
-                        $hTokenLevel -ne $null -and $hTokenLevel -gt 0
+                    $ProcessLevel -ne $null -and $ProcessLevel -ge 0 -and (
+                        $hTokenLevel -ne $null -and $hTokenLevel -ge 0
                     ) -and (
                         $ProcessLevel -eq $hTokenLevel
                     )
                 )
                 if (!$levelCheck) {
-                    throw "Fail to get level Check -or cant' reduce level check"
+                    Write-Warning "Fail to get level Check -or cant' reduce level check"
                 }
             }
 
             if (!(Invoke-UnmanagedMethod -Dll Advapi32 -Function ImpersonateLoggedOnUser -Return bool -Values @($hToken))) {
+                Write-Host
                 throw "ImpersonateLoggedOnUser failed.!"
             }
             
