@@ -10697,23 +10697,43 @@ function Get-ProcessHandle {
             }
             $attributesPtr = New-IntPtr -Size $objectAttrSize -WriteSizeAtZero
             $clientIdPtr   = New-IntPtr -Size $clientIdSize   -InitialValue $ProcID -UsePointerSize
+            
+            # Try with MAXIMUM_ALLOWED (0x02000000) first
             $ntStatus = $Global:ntdll::NtOpenProcess(
-                [ref]$handle, (0x0080 -bor 0x0800 -bor 0x0040 -bor 0x0400), $attributesPtr, $clientIdPtr)
+                [ref]$handle, 0x02000000, $attributesPtr, $clientIdPtr
+            )
+
+            # If MAXIMUM_ALLOWED fails (status code non-zero), try with specific access rights (0x0B)
+            if ($ntStatus -ne 0) {
+                $ntStatus = $Global:ntdll::NtOpenProcess(
+                    [ref]$handle, (0x0080 -bor 0x0800 -bor 0x0040 -bor 0x0400), $attributesPtr, $clientIdPtr
+                )
+            }
 
             if (!$Impersonat) {
                 return $handle
             }
             $tokenHandle = [IntPtr]::Zero
+
+            # Try with MAXIMUM_ALLOWED (0x02000000) first
             $ret = $Global:ntdll::NtOpenProcessToken(
-                $handle, (0x02 -bor 0x01 -bor 0x08), [ref]$tokenHandle
+                $handle, 0x02000000, [ref]$tokenHandle
             )
+
+            # If MAXIMUM_ALLOWED fails, try with specific access rights (0x0B)
+            if ($ret -ne 0) {
+                $ret = $Global:ntdll::NtOpenProcessToken(
+                    $handle, (0x02 -bor 0x01 -bor 0x08), [ref]$tokenHandle
+                )
+            }
             Free-IntPtr -handle $handle -Method NtHandle
             if ($tokenHandle -eq [IntPtr]::Zero) {
                 throw "NtOpenProcessToken failue .!"
             }
-            if (!($Global:kernel32::ImpersonateLoggedOnUser(
-                $tokenHandle))) {
-                throw "ImpersonateLoggedOnUser failue .!"
+
+            # Impersonate the user
+            if (!(Invoke-UnmanagedMethod -Dll Advapi32 -Function ImpersonateLoggedOnUser -Return bool -Values @($tokenHandle))) {
+                throw "ImpersonateLoggedOnUser failed.!"
             }
 
             $NewTokenHandle = [IntPtr]0
@@ -11077,7 +11097,7 @@ Function Invoke-Process {
 
             # Allocate unmanaged memory for the handle pointer
             if (-not (IsValid-IntPtr $tHandle)) {
-                throw "Invalid Service Handle"
+                throw "Invalid Process\Service Handle"
             }
             $handlePtr = New-IntPtr -hHandle $tHandle -MakeRefType
 
@@ -11101,6 +11121,10 @@ Function Invoke-Process {
                 -ProcessName $ProcessName `
                 -ServiceName $ServiceName `
                 -Impersonat $true
+            # Allocate unmanaged memory for the handle pointer
+            if (-not (IsValid-IntPtr $tHandle)) {
+                throw "Invalid Process\Service Handle"
+            }
         }
         
         # Now, Update -> lpAttributeList
