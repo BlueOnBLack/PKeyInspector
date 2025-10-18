@@ -10963,6 +10963,18 @@ write-host
 #$ConsoleApp = 'cmd'
 $ConsoleApp = 'Conhost'
 
+Invoke-Process `
+    -CommandLine "cmd /k echo Hello From TrustedInstaller && whoami" `
+    -ServiceName TrustedInstaller `
+    -RunAsConsole `
+    -RunAsParent
+
+Invoke-Process `
+    -CommandLine "cmd /k echo Hello From winlogon && whoami" `
+    -ProcessName winlogon `
+    -RunAsConsole `
+    -UseDuplicatedToken
+
 # Could Fail to start from system/TI
 Write-Host 'Invoke-ProcessAsUser, As Logon/Imprsanate' -ForegroundColor Green
 Invoke-ProcessAsUser `
