@@ -10931,41 +10931,38 @@ https://learn.microsoft.com/en-us/windows/win32/api/winsvc/ns-winsvc-service_sta
 
 --------------
 
-Clear-Host
-Write-Host
+Clear-host
+write-host
 
-Invoke-Process `
-    -CommandLine "cmd /k whoami" `
-    -RunAsConsole `
-    -WaitForExit
-
-Invoke-Process `
-    -CommandLine "cmd /k whoami" `
-    -ProcessName TrustedInstaller `
-    -RunAsConsole `
-    -RunAsParent
-
-Invoke-Process `
-    -CommandLine "cmd /k whoami" `
-    -ProcessName winlogon `
-    -RunAsConsole `
-    -UseDuplicatedToken
+#$ConsoleApp = 'cmd'
+$ConsoleApp = 'Conhost'
 
 # Could Fail to start from system/TI
 Write-Host 'Invoke-ProcessAsUser, As Logon/Imprsanate' -ForegroundColor Green
 Invoke-ProcessAsUser `
-    -Application cmd `
-    -CommandLine "/k whoami" `
+    -Application $ConsoleApp `
     -UserName Administrator `
     -Password 0444 `
     -Mode Hybrid `
+    -Method LsaLogonUser `
+    -LogonType 0x03 `
+    -RunAsConsole
+
+# Could Fail to start from system/TI
+Write-Host 'Invoke-ProcessAsUser, As Logon/Imprsanate' -ForegroundColor Green
+Invoke-ProcessAsUser `
+    -Application $ConsoleApp `
+    -UserName Administrator `
+    -Password 0444 `
+    -Mode Hybrid `
+    -Method LogonUserExExW `
+    -LogonType 0x03 `
     -RunAsConsole
 
 # Could Fail to start from system/TI
 Write-Host 'Invoke-ProcessAsUser, As Logon' -ForegroundColor Green
 Invoke-ProcessAsUser `
-    -Application cmd `
-    -CommandLine "/k whoami" `
+    -Application $ConsoleApp `
     -UserName Administrator `
     -Password 0444 `
     -Mode Logon `
@@ -10974,8 +10971,7 @@ Invoke-ProcessAsUser `
 # Work From both Normal/Admin/System/TI Account
 Write-Host 'Invoke-ProcessAsUser, As Token' -ForegroundColor Green
 Invoke-ProcessAsUser `
-    -Application cmd `
-    -CommandLine "/k whoami" `
+    -Application $ConsoleApp `
     -UserName Administrator `
     -Password 0444 `
     -Mode Token `
@@ -10984,12 +10980,12 @@ Invoke-ProcessAsUser `
 # Could fail to start if not system Account
 Write-Host 'Invoke-ProcessAsUser, As User' -ForegroundColor Green
 Invoke-ProcessAsUser `
-    -Application cmd `
-    -CommandLine "/k whoami" `
+    -Application $ConsoleApp `
     -UserName Administrator `
     -Password 0444 `
     -Mode User `
     -RunAsConsole
+
 #>
 Function Invoke-Process {
     Param (
@@ -11215,6 +11211,11 @@ Function Invoke-ProcessAsUser {
     @ CreateProcessAsUser example
     # https://github.com/msmania/logue/blob/master/logue.cpp
 
+    @ Win2000: logon32.c   -> L32pLogonUser
+    @ LAtest.: sspicli.dll -> L32pLogonUser -> SspipLogonUser
+    # https://en.verysource.com/item/win2ksrc_rar-290464.html
+    # https://en.verysource.com/code/10350396_1/logon32.c.html
+
     @ RunAsHighIL.dpr
     @ Spawn a high-integrity process from medium integrity via admin credentials (641 KiB on x64)
     # https://github.com/diversenok/NtUtilsLibrary-Examples/tree/master?tab=readme-ov-file
@@ -11225,6 +11226,15 @@ Function Invoke-ProcessAsUser {
     * Set Everyone FullControl on your current process DACL -> Impersonate -> 
     * CreateProcessWithLogon (LOGON_NETCREDENTIALS_ONLY) and specify the admin credentials. 
     * Enjoy High IL process with Interactive SID
+    
+    @ from 0xc000142 to understanding windows login setup
+    # https://0xswitch.fr/posts/windows-from-0xc000142-to-login-process
+
+    @ PrintSpoofer
+    # https://github.com/itm4n/PrintSpoofer/tree/master
+
+    @ Coerced potato
+    # https://github.com/Prepouce/CoercedPotato
     #>
 
     <#
@@ -11488,12 +11498,16 @@ public class TokenHelper {
         Ldr-LoadDll -dll "C:\Temp\dacl.dll" -dwFlags ALTERED_SEARCH | Out-Null
         $lpProcessInformation = New-IntPtr -Size $infoSize.ProcessInformationSize
         $lpStartupInfo = New-IntPtr -Size $infoSize.lpStartupInfoSize -WriteSizeAtZero
+        $CreateFlags = [PsObject]@{
+            SUSPENDED    = 0x00000004
+            ENVIRONMENT  = 0x00000400
+            CONSOLE      = 0x00000010
+            GUI          = 0x08000000
+        }
         $flags = if ($RunAsConsole) {
-            # CREATE_NEW_CONSOLE / CREATE_UNICODE_ENVIRONMENT
-            0x00000010 -bor 0x00000400
+            $CreateFlags.CONSOLE -bor $CreateFlags.ENVIRONMENT -bor $CreateFlags.SUSPENDED
         } else {
-            # CREATE_NO_WINDOW / CREATE_UNICODE_ENVIRONMENT
-            0x08000000 -bor 0x00000400
+            $CreateFlags.GUI     -bor $CreateFlags.ENVIRONMENT -bor $CreateFlags.SUSPENDED
         }
 
         $AppPath = (Get-Command $Application).Source
@@ -11638,11 +11652,11 @@ public class TokenHelper {
         } elseif ($Mode -eq 'Token') {
 
             # Prefere hToken for current User
-            $hInfo = Process-UserToken -hToken $hToken
+            $hInfo = Process-UserToken -hToken $hToken -UseCurrent
 
             # Set lpDesktop Info
-            $lpDesktopPtr = [Marshal]::StringToHGlobalUni("winsta0\default")
-            [Marshal]::WriteIntPtr($lpStartupInfo, $OffsetList.lpDesktopOff, $lpDesktopPtr)
+            #$lpDesktopPtr = [Marshal]::StringToHGlobalUni("winsta0\default")
+            #[Marshal]::WriteIntPtr($lpStartupInfo, $OffsetList.lpDesktopOff, $lpDesktopPtr)
 
             # Set WindowFlags to STARTF_USESHOWWINDOW (0x00000001)
             [Marshal]::WriteInt32([IntPtr]::Add($lpStartupInfo, $OffsetList.WindowFlags), 0x01)
@@ -11660,7 +11674,7 @@ public class TokenHelper {
             )
 
             # Clean Params laters
-            Process-UserToken -Params $hInfo
+            Process-UserToken -Params $hInfo -UseCurrent
 
         } elseif ($Mode -eq 'User') {
             if (!(Check-AccountType -AccType System)) {
@@ -11669,7 +11683,7 @@ public class TokenHelper {
             }
             
             # Prefere hToken for current User
-            $hInfo = Process-UserToken -hToken $hToken
+            $hInfo = Process-UserToken -hToken $hToken -UseCurrent
             
             # Impersonate the user
             if (!(Invoke-UnmanagedMethod -Dll Advapi32 -Function ImpersonateLoggedOnUser -Return bool -Values @($hToken))) {
@@ -11677,8 +11691,8 @@ public class TokenHelper {
             }
 
             # Set lpDesktop Info
-            $lpDesktopPtr = [Marshal]::StringToHGlobalUni("winsta0\default")
-            [Marshal]::WriteIntPtr($lpStartupInfo, $OffsetList.lpDesktopOff, $lpDesktopPtr)
+            #$lpDesktopPtr = [Marshal]::StringToHGlobalUni("winsta0\default")
+            #[Marshal]::WriteIntPtr($lpStartupInfo, $OffsetList.lpDesktopOff, $lpDesktopPtr)
 
             # Set WindowFlags to STARTF_USESHOWWINDOW (0x00000001)
             [Marshal]::WriteInt32([IntPtr]::Add($lpStartupInfo, $OffsetList.WindowFlags), 0x01)
@@ -11698,7 +11712,22 @@ public class TokenHelper {
             Invoke-UnmanagedMethod -Dll Advapi32 -Function RevertToSelf -Return bool | Out-Null
 
             # Clean Params laters
-            Process-UserToken -Params $hInfo
+            Process-UserToken -Params $hInfo -UseCurrent
+        }
+
+        if ($ret) {
+            <#
+            typedef struct _PROCESS_INFORMATION {
+                HANDLE hProcess;
+                HANDLE hThread;
+                DWORD  dwProcessId;
+                DWORD  dwThreadId;
+            } PROCESS_INFORMATION, *PPROCESS_INFORMATION, *LPPROCESS_INFORMATION;
+            #>
+
+            [IntPtr]$hProcess = [marshal]::ReadIntPtr($lpProcessInformation, 0x00)
+            [IntPtr]$hThread  = [marshal]::ReadIntPtr($lpProcessInformation, [IntPtr]::Size)
+            Invoke-UnmanagedMethod ntdll.dll NtResumeThread -Values @($hThread, [IntPtr]::Zero) | Out-Null
         }
         
         if (!$ret) {
