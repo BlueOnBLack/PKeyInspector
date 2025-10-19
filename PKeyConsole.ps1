@@ -9349,6 +9349,7 @@ Function NtCurrentTeb {
     } else {
         
         ## Protect
+        $Address = [IntPtr]::Zero
         $baseAddressPtr = [gchandle]::Alloc($shellcode, 'pinned')
         $baseAddress = $baseAddressPtr.AddrOfPinnedObject()
         [IntPtr]$tempBase = $baseAddress
@@ -10072,6 +10073,189 @@ function Get-DllHandle {
     return [IntPtr]::Zero
 }
 
+    if (!([PSTypeName]'TokenHelper').Type) {
+        $tokenHelperCode = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+
+public class TokenHelper {
+ 
+   // Token Integrity Constants (RID values)
+    private const int TokenIntegrityLevel = 25;
+    private const int SECURITY_MANDATORY_UNTRUSTED_RID         = 0x00000000;
+    private const int SECURITY_MANDATORY_LOW_RID               = 0x00001000;
+    private const int SECURITY_MANDATORY_MEDIUM_RID            = 0x00002000;
+    private const int SECURITY_MANDATORY_MEDIUM_PLUS_RID       = 0x00003000;
+    private const int SECURITY_MANDATORY_HIGH_RID              = 0x00004000;
+    private const int SECURITY_MANDATORY_SYSTEM_RID            = 0x00005000;
+    private const int SECURITY_MANDATORY_PROTECTED_PROCESS_RID = 0x00006000;
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationToken(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    // Define NtSetInformationToken signature
+    [DllImport("ntdll.dll", SetLastError = true)]
+    public static extern int NtSetInformationToken(
+        IntPtr TokenHandle,
+        Int32 TokenInformationClass,
+        IntPtr TokenInformation,
+        uint TokenInformationLength
+    );
+
+    // Define the SID structure
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID
+    {
+        public byte Revision;
+        public byte SubAuthorityCount;
+        public SID_IDENTIFIER_AUTHORITY IdentifierAuthority;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        public int[] SubAuthority;
+    }
+
+    // Define the SID_IDENTIFIER_AUTHORITY structure
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID_IDENTIFIER_AUTHORITY
+    {
+        public byte Value0;
+        public byte Value1;
+        public byte Value2;
+        public byte Value3;
+        public byte Value4;
+        public byte Value5;
+    }
+
+    // Define SID_AND_ATTRIBUTES structure
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID_AND_ATTRIBUTES
+    {
+        public IntPtr Sid;
+        public uint Attributes;
+    }
+
+    // Query the token integrity level
+    public static int QueryTokenIntegrityLevel(IntPtr tokenHandle)
+    {
+        int returnLength = 0;
+        int status = NtQueryInformationToken(tokenHandle, TokenIntegrityLevel, IntPtr.Zero, 0, out returnLength);
+        IntPtr buffer = Marshal.AllocHGlobal(returnLength);
+
+        try
+        {
+            status = NtQueryInformationToken(tokenHandle, TokenIntegrityLevel, buffer, returnLength, out returnLength);
+            if (status == 0)  // Success
+            {
+                SID_AND_ATTRIBUTES sid = Marshal.PtrToStructure<SID_AND_ATTRIBUTES>(buffer);
+                return RtlxRidSid(sid.Sid);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+
+        return SECURITY_MANDATORY_UNTRUSTED_RID; // Default to Untrusted
+    }
+
+    // Extract the integrity level from the SID (last sub-authority)
+    static int RtlxRidSid(IntPtr sid)
+    {
+        int subAuthorityCount = Marshal.ReadByte(sid, 1); // Second byte in SID is SubAuthorityCount
+        IntPtr subAuthorityPtr = IntPtr.Add(sid, 2 + Marshal.SizeOf(typeof(SID_IDENTIFIER_AUTHORITY)));
+        int lastSubAuthority = Marshal.ReadInt32(IntPtr.Add(subAuthorityPtr, (subAuthorityCount - 1) * sizeof(int)));
+        return MapIntegrityLevel(lastSubAuthority);
+    }
+
+    // Map sub-authority to integrity level using a traditional switch statement
+    static int MapIntegrityLevel(int subAuthority)
+    {
+        switch (subAuthority)
+        {
+            case 0x00000000:
+                return SECURITY_MANDATORY_UNTRUSTED_RID;  // Untrusted
+            case 0x00001000:
+                return SECURITY_MANDATORY_LOW_RID;        // Low Integrity
+            case 0x00002000:
+                return SECURITY_MANDATORY_MEDIUM_RID;     // Medium Integrity
+            case 0x00003000:
+                return SECURITY_MANDATORY_MEDIUM_PLUS_RID; // Medium High Integrity
+            case 0x00004000:
+                return SECURITY_MANDATORY_HIGH_RID;       // High Integrity
+            case 0x00005000:
+                return SECURITY_MANDATORY_SYSTEM_RID;     // System Integrity
+            case 0x00006000:
+                return SECURITY_MANDATORY_PROTECTED_PROCESS_RID; // Protected Process
+            default:
+                return SECURITY_MANDATORY_UNTRUSTED_RID;  // Default to Untrusted if unknown
+        }
+    }
+
+    // Function to create a SID for the integrity level
+    public static Int32 CreateIntegritySid(int integrityLevel, ref IntPtr siaPointer)
+    {
+        IntPtr sidPointer = IntPtr.Zero;
+
+        try
+        {
+            // Prepare the SID structure
+            SID sid = new SID
+            {
+                Revision = 1,               // SID revision version
+                SubAuthorityCount = 1,      // We will use just one sub-authority (integrity level)
+                IdentifierAuthority = new SID_IDENTIFIER_AUTHORITY
+                {
+                    Value0 = 0,
+                    Value1 = 0,
+                    Value2 = 0,
+                    Value3 = 0,
+                    Value4 = 0,
+                    Value5 = 16             // S-1-16 (Integrity level authority)
+                },
+                SubAuthority = new int[8]   // Initialize the SubAuthority array with 8 elements
+                {
+                    integrityLevel,         // First element holds the integrity level (e.g., 0x00002000 for Medium)
+                    0, 0, 0, 0, 0, 0, 0     // Pad the rest with 0s
+                }
+            };
+
+            // Allocate memory for the SID structure
+            int sidSize = Marshal.SizeOf(sid);
+            sidPointer = Marshal.AllocHGlobal(sidSize);
+            Marshal.StructureToPtr(sid, sidPointer, false); // Marshal SID structure to the allocated memory
+
+            // Prepare the SID_AND_ATTRIBUTES structure
+            SID_AND_ATTRIBUTES mandatoryLabel = new SID_AND_ATTRIBUTES
+            {
+                Sid = sidPointer,          // SID pointer
+                Attributes = 0x00000040     // SE_GROUP_INTEGRITY_ENABLED (just an example attribute)
+            };
+
+            // Allocate memory for the SID_AND_ATTRIBUTES structure
+            int siaSize = Marshal.SizeOf(mandatoryLabel);
+            siaPointer = Marshal.AllocHGlobal(siaSize);
+            Marshal.StructureToPtr(mandatoryLabel, siaPointer, false); // Marshal SID_AND_ATTRIBUTES structure to the allocated memory
+
+            // Return the size of the SID_AND_ATTRIBUTES structure
+            return siaSize;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Error: " + ex.Message);
+        }
+
+        return 0; // Return 0 in case of failure
+    }
+}
+'@
+        Add-Type $tokenHelperCode -Language CSharp -ErrorAction Stop
+    }
 ENUM SERVICE_STATUS {
     STOPPED = 0x00000001
     START_PENDING = 0x00000002
@@ -11298,10 +11482,7 @@ Function Invoke-ProcessAsUser {
         [switch] $RunAsConsole,
 
         [Parameter(Mandatory=$false)]
-        [switch] $LoadProfile,
-
-        [Parameter(Mandatory=$false)]
-        [switch] $Impersonate
+        [switch] $LoadProfile
     )
 
     <#
@@ -11338,191 +11519,6 @@ Function Invoke-ProcessAsUser {
     @ Coerced potato
     # https://github.com/Prepouce/CoercedPotato
     #>
-
-
-    if (!([PSTypeName]'TokenHelper').Type) {
-        $tokenHelperCode = @'
-using System;
-using System.Runtime.InteropServices;
-using System.Security.Principal;
-
-public class TokenHelper {
- 
-   // Token Integrity Constants (RID values)
-    private const int TokenIntegrityLevel = 25;
-    private const int SECURITY_MANDATORY_UNTRUSTED_RID = 0x00000000;
-    private const int SECURITY_MANDATORY_LOW_RID = 0x00001000;
-    private const int SECURITY_MANDATORY_MEDIUM_RID = 0x00002000;
-    private const int SECURITY_MANDATORY_MEDIUM_PLUS_RID = 0x00003000;
-    private const int SECURITY_MANDATORY_HIGH_RID = 0x00004000;
-    private const int SECURITY_MANDATORY_SYSTEM_RID = 0x00005000;
-    private const int SECURITY_MANDATORY_PROTECTED_PROCESS_RID = 0x00006000;
-
-    [DllImport("ntdll.dll")]
-    public static extern int NtQueryInformationToken(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
-
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetCurrentProcess();
-
-    // Define NtSetInformationToken signature
-    [DllImport("ntdll.dll", SetLastError = true)]
-    public static extern int NtSetInformationToken(
-        IntPtr TokenHandle,
-        Int32 TokenInformationClass,
-        IntPtr TokenInformation,
-        uint TokenInformationLength
-    );
-
-    // Define the SID structure
-    [StructLayout(LayoutKind.Sequential)]
-    public struct SID
-    {
-        public byte Revision;
-        public byte SubAuthorityCount;
-        public SID_IDENTIFIER_AUTHORITY IdentifierAuthority;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
-        public int[] SubAuthority;
-    }
-
-    // Define the SID_IDENTIFIER_AUTHORITY structure
-    [StructLayout(LayoutKind.Sequential)]
-    public struct SID_IDENTIFIER_AUTHORITY
-    {
-        public byte Value0;
-        public byte Value1;
-        public byte Value2;
-        public byte Value3;
-        public byte Value4;
-        public byte Value5;
-    }
-
-    // Define SID_AND_ATTRIBUTES structure
-    [StructLayout(LayoutKind.Sequential)]
-    public struct SID_AND_ATTRIBUTES
-    {
-        public IntPtr Sid;
-        public uint Attributes;
-    }
-
-    // Query the token integrity level
-    public static int QueryTokenIntegrityLevel(IntPtr tokenHandle)
-    {
-        int returnLength = 0;
-        int status = NtQueryInformationToken(tokenHandle, TokenIntegrityLevel, IntPtr.Zero, 0, out returnLength);
-        IntPtr buffer = Marshal.AllocHGlobal(returnLength);
-
-        try
-        {
-            status = NtQueryInformationToken(tokenHandle, TokenIntegrityLevel, buffer, returnLength, out returnLength);
-            if (status == 0)  // Success
-            {
-                SID_AND_ATTRIBUTES sid = Marshal.PtrToStructure<SID_AND_ATTRIBUTES>(buffer);
-                return RtlxRidSid(sid.Sid);
-            }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
-        }
-
-        return SECURITY_MANDATORY_UNTRUSTED_RID; // Default to Untrusted
-    }
-
-    // Extract the integrity level from the SID (last sub-authority)
-    static int RtlxRidSid(IntPtr sid)
-    {
-        int subAuthorityCount = Marshal.ReadByte(sid, 1); // Second byte in SID is SubAuthorityCount
-        IntPtr subAuthorityPtr = IntPtr.Add(sid, 2 + Marshal.SizeOf(typeof(SID_IDENTIFIER_AUTHORITY)));
-        int lastSubAuthority = Marshal.ReadInt32(IntPtr.Add(subAuthorityPtr, (subAuthorityCount - 1) * sizeof(int)));
-        return MapIntegrityLevel(lastSubAuthority);
-    }
-
-    // Map sub-authority to integrity level using a traditional switch statement
-    static int MapIntegrityLevel(int subAuthority)
-    {
-        switch (subAuthority)
-        {
-            case 0x00000000:
-                return SECURITY_MANDATORY_UNTRUSTED_RID;  // Untrusted
-            case 0x00001000:
-                return SECURITY_MANDATORY_LOW_RID;        // Low Integrity
-            case 0x00002000:
-                return SECURITY_MANDATORY_MEDIUM_RID;     // Medium Integrity
-            case 0x00003000:
-                return SECURITY_MANDATORY_MEDIUM_PLUS_RID; // Medium High Integrity
-            case 0x00004000:
-                return SECURITY_MANDATORY_HIGH_RID;       // High Integrity
-            case 0x00005000:
-                return SECURITY_MANDATORY_SYSTEM_RID;     // System Integrity
-            case 0x00006000:
-                return SECURITY_MANDATORY_PROTECTED_PROCESS_RID; // Protected Process
-            default:
-                return SECURITY_MANDATORY_UNTRUSTED_RID;  // Default to Untrusted if unknown
-        }
-    }
-
-    // Function to create a SID for the integrity level
-    public static Int32 CreateIntegritySid(int integrityLevel, ref IntPtr siaPointer)
-    {
-        IntPtr sidPointer = IntPtr.Zero;
-
-        try
-        {
-            // Prepare the SID structure
-            SID sid = new SID
-            {
-                Revision = 1,               // SID revision version
-                SubAuthorityCount = 1,      // We will use just one sub-authority (integrity level)
-                IdentifierAuthority = new SID_IDENTIFIER_AUTHORITY
-                {
-                    Value0 = 0,
-                    Value1 = 0,
-                    Value2 = 0,
-                    Value3 = 0,
-                    Value4 = 0,
-                    Value5 = 16             // S-1-16 (Integrity level authority)
-                },
-                SubAuthority = new int[8]   // Initialize the SubAuthority array with 8 elements
-                {
-                    integrityLevel,         // First element holds the integrity level (e.g., 0x00002000 for Medium)
-                    0, 0, 0, 0, 0, 0, 0     // Pad the rest with 0s
-                }
-            };
-
-            // Allocate memory for the SID structure
-            int sidSize = Marshal.SizeOf(sid);
-            sidPointer = Marshal.AllocHGlobal(sidSize);
-            Marshal.StructureToPtr(sid, sidPointer, false); // Marshal SID structure to the allocated memory
-
-            // Prepare the SID_AND_ATTRIBUTES structure
-            SID_AND_ATTRIBUTES mandatoryLabel = new SID_AND_ATTRIBUTES
-            {
-                Sid = sidPointer,          // SID pointer
-                Attributes = 0x00000040     // SE_GROUP_INTEGRITY_ENABLED (just an example attribute)
-            };
-
-            // Allocate memory for the SID_AND_ATTRIBUTES structure
-            int siaSize = Marshal.SizeOf(mandatoryLabel);
-            siaPointer = Marshal.AllocHGlobal(siaSize);
-            Marshal.StructureToPtr(mandatoryLabel, siaPointer, false); // Marshal SID_AND_ATTRIBUTES structure to the allocated memory
-
-            // Return the size of the SID_AND_ATTRIBUTES structure
-            return siaSize;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("Error: " + ex.Message);
-        }
-
-        return 0; // Return 0 in case of failure
-    }
-}
-'@
-        Add-Type $tokenHelperCode -Language CSharp -ErrorAction Stop
-    }
     
     try {
         $hProcess, $hThread = [IntPtr]0, [IntPtr]0
@@ -12060,7 +12056,7 @@ function Get-EnvironmentBlockLength {
             $lpEnvironment = [IntPtr]::Zero
             if (!(Invoke-UnmanagedMethod -Dll Userenv -Function CreateEnvironmentBlock -Return bool -Values @(([ref]$lpEnvironment), $hToken, $false))) {
                 $lastError = [Marshal]::GetLastWin32Error()
-                throw "Failed to create environment block. Last error: $lastError"
+                Write-Warning "Failed to create environment block. Last error: $lastError"
             }
             $lpLength = Get-EnvironmentBlockLength -lpEnvironment $lpEnvironment
             [Marshal]::WriteIntPtr(
@@ -12271,7 +12267,8 @@ function Get-EnvironmentBlockLength {
         if ($Ret -eq 0) {
             return $true
         }
-
+        $RetMsg = Parse-ErrorMessage $Ret -Flags NTSTATUS
+        Write-Warning "NtCreateUserProcess Fail with Error Code $RetMsg"
         return $false
     }
     finally {
@@ -12289,11 +12286,6 @@ function Get-EnvironmentBlockLength {
         $SpaceUnicode = $unicodeBuf = $FileInfoPtr = $AttributeListPtr = [IntPtr]0l
     }
 }
-
-<#
-CsrClientCall Helper,
-update system new process born.
-#>
 function Send-CsrClientCall {
     param (
         [IntPtr]$hProcess,
