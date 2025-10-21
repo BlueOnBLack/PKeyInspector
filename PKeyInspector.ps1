@@ -3141,7 +3141,9 @@ Function Init-advapi32 {
         @{ Name = "QueryServiceStatusEx";    Dll = "advapi32.dll"; ReturnType = [BOOL];   Parameters = [Type[]]@([IntPtr],[Int32],[IntPtr],[Int32],[UInt32].MakeByRefType()) },
         @{ Name = "CreateProcessWithTokenW"; Dll = "advapi32.dll"; ReturnType = [BOOL];   Parameters = [Type[]]@([IntPtr], [Int32], [IntPtr], [IntPtr], [Int32], [IntPtr],[IntPtr],[IntPtr],[IntPtr]) },
         @{ Name = "LsaRemoveAccountRights";  Dll = "advapi32.dll"; ReturnType = [UInt32]; Parameters = [Type[]]@([IntPtr], [IntPtr], [Int32], [IntPtr], [Int32]) },
-        @{ Name = "LsaAddAccountRights";     Dll = "advapi32.dll"; ReturnType = [UInt32]; Parameters = [Type[]]@([IntPtr], [IntPtr], [IntPtr], [Int32]) }
+        @{ Name = "LsaAddAccountRights";     Dll = "advapi32.dll"; ReturnType = [UInt32]; Parameters = [Type[]]@([IntPtr], [IntPtr], [IntPtr], [Int32]) },
+        @{ Name = "LookupAccountNameW";      Dll = "advapi32.dll"; ReturnType = [UInt32]; Parameters = [Type[]]@([IntPtr], [string], [IntPtr], [Int32].MakeByRefType(),[IntPtr], [Int32].MakeByRefType(), [Boolean].MakeByRefType()) },
+        @{ Name = "ConvertSidToStringSidW";  Dll = "advapi32.dll"; ReturnType = [UInt32]; Parameters = [Type[]]@([IntPtr], [IntPtr]) }
     )
     return Register-NativeMethods $functions
 }
@@ -8108,10 +8110,23 @@ typedef struct _LUID {
 
 // Demo
 
-# Make sure to assigen SeAssignPrimaryTokenPrivilege Priv
-$AssignPrivilege = Adjust-TokenPrivileges -Query | Where-Object { $_.Name -match "SeAssignPrimaryTokenPrivilege" }
+# Make sure to assigen SeAssignPrimaryTokenPrivilege Priv to Account
+$AssignPrivilege = Adjust-TokenPrivileges -Query | ? Name -match SeAssignPrimaryTokenPrivilege
 if (-not $AssignPrivilege) {
-   Adjust-TokenPrivileges -Privilege SeAssignPrimaryTokenPrivilege -Account Administrator
+    try {
+        if (Adjust-TokenPrivileges -Privilege SeAssignPrimaryTokenPrivilege -Account Administrator) {
+            Write-Host ""
+            Write-Host "Successfully applied 'SeAssignPrimaryTokenPrivilege' to the 'Administrator' account." -ForegroundColor Cyan
+            Write-Host "Please log off and log back in to apply the changes." -ForegroundColor Green
+            Write-Host ""
+        } else {
+            Write-Host ""
+            Write-Host "Failed to apply 'SeAssignPrimaryTokenPrivilege' to the 'Administrator' account." -ForegroundColor Red
+            Write-Host "Please check your permissions or the account status." -ForegroundColor Yellow
+            Write-Host ""
+        }
+    }
+    catch {}
 }
 
 --------------------
@@ -8210,7 +8225,6 @@ Function Adjust-TokenPrivileges {
         LOOKUP_NAMES                = 0x00000800L
         NOTIFICATION                = 0x00001000L
     }
-
     function Get-PrivilegeLuid {
         param (
             [ValidateNotNullOrEmpty()]
@@ -8245,6 +8259,96 @@ Function Adjust-TokenPrivileges {
             $policyHandle = $null
         }
         return $luid
+    }
+    function Get-AccountInfo {
+        param (
+            [ValidateNotNullOrEmpty()]
+            [string]$AccName = $env:USERNAME,
+            [switch]$Debug
+        )
+
+        if ($Debug) { Write-Host "Starting SID retrieval for account: $AccName" }
+
+        # Initialize variables
+        [IntPtr]$pSid = [IntPtr]::Zero
+        [Int32]$AccSize = 0
+        [IntPtr]$domainPtr = [IntPtr]::Zero
+        [Int32]$domainSize = 0
+        [Bool]$peUse = $false
+
+        # Lookup account SID
+        $ret = $Global:advapi32::LookupAccountNameW(
+                [IntPtr]::Zero,
+                $AccName, $pSid,
+                ([ref]$AccSize),
+                [IntPtr]::Zero, ([ref]$domainSize),
+                ([ref]$peUse)
+            )
+
+        if ($AccSize -le 0) {
+            Write-Warning "Error: Account '$AccName' not found or invalid name."
+            return $null
+        }
+
+        if ($Debug) { Write-Host "Account found. Allocating memory for SID and domain." }
+
+        # Allocate memory for SID and domain
+        $pSid = New-IntPtr -Size $AccSize
+        $domainPtr = New-IntPtr (($domainSize + 2) * 2)
+
+        # Second lookup to get full SID and domain name
+        $ret = $Global:advapi32::LookupAccountNameW(
+                [IntPtr]::Zero,
+                $AccName, $pSid,
+                ([ref]$AccSize),
+                $domainPtr, ([ref]$domainSize),
+                ([ref]$peUse)
+            )
+
+        if ($ret -ne 1) {
+            Write-Warning "Error: Unable to resolve account '$AccName' to SID."
+            Free-IntPtr -handle $domainPtr -Method Auto
+            return $null
+        }
+
+        # Retrieve domain and free memory
+        $domain = [marshal]::PtrToStringUni($domainPtr)
+        Free-IntPtr -handle $domainPtr -Method Auto
+        if ($Debug) { Write-Host "Domain retrieved: $domain" }
+
+        # Convert SID to string
+        $sidStringPtr = New-IntPtr -Size ([IntPtr]::Size) 
+        $ret = $Global:advapi32::ConvertSidToStringSidW($pSid, $sidStringPtr)
+        if ($ret) {
+        
+            ## Actual data hold as Pointer --> @@ by Ref @@
+            ## Better than let Managed code handle it
+            ## -------> [ref]Object --> Could fail .!
+
+            $handle = [Marshal]::ReadIntPtr($sidStringPtr)
+            $sidString = [Marshal]::PtrToStringUni($handle)
+            Free-IntPtr -handle $sidStringPtr -Method Auto
+            Free-IntPtr -handle $handle -Method Local
+
+        } else {
+            Write-Warning "Error: Unable to convert SID for account '$AccName'."
+            Free-IntPtr -handle $sidStringPtr -Method Auto
+            return $null
+        }
+
+        if ($Debug) { Write-Host "SID converted: $sidString" }
+
+        # Create and return the PSCustomObject with account details
+        $accountInfo = [PSCustomObject]@{
+            AccountName = $AccName
+            Domain      = $domain
+            SID         = $sidString
+            pSid        = $pSid
+        }
+
+        if ($Debug) { Write-Host "Account information retrieved successfully." }
+
+        return $accountInfo
     }
 
     $TOKEN_QUERY = 0x00000008;
@@ -8395,12 +8499,19 @@ Function Adjust-TokenPrivileges {
             throw "LsaOpenPolicy Failure .!"
         }
         
+        <#
         $NTAccount = [NTAccount]::new($Account)
         $identity = $NTAccount.Translate([System.Security.Principal.SecurityIdentifier])
         $AccountSid = New-IntPtr -Size $identity.BinaryLength
         $buffer = New-Object byte[] $identity.BinaryLength
         $identity.GetBinaryForm($buffer, 0)
         [marshal]::Copy($buffer, 0x0, $AccountSid, $buffer.Length)
+        #>
+
+        [IntPtr]$AccountSid = Get-AccountInfo -AccName $Account | select -ExpandProperty pSid
+        if (!(IsValid-IntPtr $AccountSid)) {
+            throw "Not a valid AccountSid .!"
+        }
 
         $CountOfRights = $Privilege.Length
         $blockSize = [UIntPtr]::new(([IntPtr]::Size)* 2)
@@ -11345,10 +11456,23 @@ write-host
 #$ConsoleApp = 'cmd'
 $ConsoleApp = 'Conhost'
 
-# Make sure to assigen SeAssignPrimaryTokenPrivilege Priv
-$AssignPrivilege = Adjust-TokenPrivileges -Query | Where-Object { $_.Name -match "SeAssignPrimaryTokenPrivilege" }
+# Make sure to assigen SeAssignPrimaryTokenPrivilege Priv to Account
+$AssignPrivilege = Adjust-TokenPrivileges -Query | ? Name -match SeAssignPrimaryTokenPrivilege
 if (-not $AssignPrivilege) {
-   Adjust-TokenPrivileges -Privilege SeAssignPrimaryTokenPrivilege -Account Administrator
+    try {
+        if (Adjust-TokenPrivileges -Privilege SeAssignPrimaryTokenPrivilege -Account Administrator) {
+            Write-Host ""
+            Write-Host "Successfully applied 'SeAssignPrimaryTokenPrivilege' to the 'Administrator' account." -ForegroundColor Cyan
+            Write-Host "Please log off and log back in to apply the changes." -ForegroundColor Green
+            Write-Host ""
+        } else {
+            Write-Host ""
+            Write-Host "Failed to apply 'SeAssignPrimaryTokenPrivilege' to the 'Administrator' account." -ForegroundColor Red
+            Write-Host "Please check your permissions or the account status." -ForegroundColor Yellow
+            Write-Host ""
+        }
+    }
+    catch {}
 }
 
 Invoke-Process `
@@ -11855,7 +11979,7 @@ Function Invoke-ProcessAsUser {
             Process-UserToken -Params $hInfo -UseCurrent
 
         } elseif ($Mode -eq 'User') {
-            $AssignPrivilege = Adjust-TokenPrivileges -Query | Where-Object { $_.Name -match 'SeAssignPrimaryTokenPrivilege' }
+            $AssignPrivilege = Adjust-TokenPrivileges -Query | ? Name -match SeAssignPrimaryTokenPrivilege
             if (!(Check-AccountType -AccType System) -or -not $AssignPrivilege) {
                 if (-not $AssignPrivilege) {        
                     Write-Warning "Missing Priv, {SeAssignPrimaryTokenPrivilege}, Could fail if not system Account .!"
@@ -12103,7 +12227,7 @@ function Get-EnvironmentBlockLength {
     return $LengthInBytes
 }
     try {
-        $AssignPrivilege = Adjust-TokenPrivileges -Query | Where-Object { $_.Name -match 'SeAssignPrimaryTokenPrivilege' }
+        $AssignPrivilege = Adjust-TokenPrivileges -Query | ? Name -match SeAssignPrimaryTokenPrivilege
         if ($hToken -ne [IntPtr]::Zero -and (!(Check-AccountType -AccType System) -or -not $AssignPrivilege)) {
             if (-not $AssignPrivilege) {        
                 Write-Warning "Missing Priv, {SeAssignPrimaryTokenPrivilege}, Could fail if not system Account .!"
