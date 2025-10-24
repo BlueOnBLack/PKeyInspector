@@ -12,12 +12,10 @@
 ## About
 **PKeyInspector** is a Proof‑Of‑Concept tool for administrators, auditors, and authorized researchers that aggregates metadata from `pkeyconfig` files, vendor XMLs, and system sources and produces human‑friendly reports (HTML, PDF, Excel, CSV). It also demonstrates the use of low‑level and undocumented platform internals to collect richer metadata when required.
 
-> Because low‑level and undocumented APIs can access internal structures and behavior that are not guaranteed stable or safe, those capabilities are explicitly **research‑only**, gated, and disabled by default.
-
 ---
 
 ## Capabilities (feature list)
-> Full feature surface. Sensitive features are flagged as research‑only and disabled by default.
+> Full feature surface.
 
 - Parse `pkeyconfig` XML files (Office/Windows) and extract SKU/product metadata.
 - Interactive **HTML** reports with client‑side search/filter, paging, and sorting.
@@ -31,16 +29,16 @@
   - Decode KeyInfo-like structures; parse binary payloads in read‑only mode.
   - Folder scanning and batch decode (read‑only, non‑destructive).
 - Extraction options (RESEARCH‑ONLY / GATED):
-  - Candidate extraction from binaries (`.exe`, `.dll`) and other artifacts (disabled by default).
-  - Parse registry data blocks including kernel policy blocks for license metadata (disabled by default).
+  - Candidate extraction from binaries (`.exe`, `.dll`) and other artifacts.
+  - Parse registry data blocks including kernel policy blocks for license metadata.
 - System information collector:
   - Collect OS Major/Minor/Build/UBR/EditionID via documented APIs.
-  - Research-only collectors use low‑level reads of memory/offsets to recover additional context (disabled by default).
+  - Research-only collectors use low‑level reads of memory/offsets to recover additional context.
 - Error mapping & diagnostics: support for CBS, BITS, HTTP, UPDATE, NETWORK, WIN32, NTSTATUS, ACTIVATION code sets (best‑effort).
 - Update matrix: build update compatibility tables from XML datasets, including unsupported versions (offline).
 - Active license & settings view (OEM defaults, active SKU, and related metadata).
-- Activation/license management (RESEARCH‑ONLY / GATED): integration points for lab/test workflows (disabled by default).
-- Check Products keys against Offical MS Server API, 3 Api In total
+- Activation/license management (RESEARCH‑ONLY / GATED): integration points for lab/test workflows.
+- Check Products keys against Official MS Server API, 3 Api In total
   
 ---
 
