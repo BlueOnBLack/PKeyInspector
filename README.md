@@ -28,7 +28,7 @@
 - Decoding options:
   - Decode KeyInfo-like structures; parse binary payloads in read‑only mode.
   - Folder scanning and batch decode (read‑only, non‑destructive).
-- Extraction options (RESEARCH‑ONLY / GATED):
+- Extraction options.
   - Candidate extraction from binaries (`.exe`, `.dll`) and other artifacts.
   - Parse registry data blocks including kernel policy blocks for license metadata.
 - System information collector:
