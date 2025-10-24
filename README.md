@@ -5,22 +5,7 @@
 [![Releases](https://img.shields.io/badge/releases-v1.0-blue.svg)]()
 
 > POC: Parse Office/Windows `pkeyconfig` and related SKU/license metadata and present interactive HTML reports (searchable) with export to PDF, Excel, CSV, and more.  
-> Uses advanced, low‑level techniques (including undocumented or platform‑internal APIs) to collect richer system metadata — **research‑only** and disabled by default.
-
----
-
-## Table of contents
-- [About](#about)  
-- [Why low‑level/undocumented APIs?](#why-low-levelundocumented-apis)  
-- [Capabilities (feature list)](#capabilities-feature-list)  
-- [Primary goals](#primary-goals)  
-- [Quick start (POC)](#quick-start-poc)  
-- [Examples & outputs](#examples--outputs)  
-- [Research‑only / sensitive features (gated)](#research-only--sensitive-features-gated)  
-- [Security, Legal & Responsible Use](#security-legal--responsible-use)  
-- [Contributing & Code of Conduct](#contributing--code-of-conduct)  
-- [License](#license)  
-- [Credits & references](#credits--references)
+> Uses advanced, low‑level techniques (including undocumented or platform‑internal APIs) to collect richer system metadata
 
 ---
 
@@ -28,17 +13,6 @@
 **PKeyInspector** is a Proof‑Of‑Concept tool for administrators, auditors, and authorized researchers that aggregates metadata from `pkeyconfig` files, vendor XMLs, and system sources and produces human‑friendly reports (HTML, PDF, Excel, CSV). It also demonstrates the use of low‑level and undocumented platform internals to collect richer metadata when required.
 
 > Because low‑level and undocumented APIs can access internal structures and behavior that are not guaranteed stable or safe, those capabilities are explicitly **research‑only**, gated, and disabled by default.
-
----
-
-## Why low‑level / undocumented APIs?
-High‑level documented APIs and registry queries are the safest route for typical inventory tasks, but they sometimes omit contextual metadata or vendor annotations. Low‑level techniques are included in this PoC to demonstrate:
-
-- how additional contextual metadata can be discovered in memory, binary structures, or policy blocks,
-- methods to recover richer SKU/product information when documented sources are unavailable,
-- research techniques for forensic analysis and vendor‑compatibility research.
-
-**Important:** Low‑level methods are brittle, platform‑version dependent, and may change or break with updates. They can also pose safety, privacy, and legal risks — see the Research‑only section and `SECURITY.md`.
 
 ---
 
