@@ -10884,7 +10884,6 @@ Function Obtain-UserToken {
         $USER = $Module.CreateType()
     }
 
-
     $phToken = [IntPtr]::Zero
     $UserNamePtr = [Marshal]::StringToHGlobalUni($UserName)
     $PasswordPtr = if ([string]::IsNullOrEmpty($Password)) { [IntPtr]::Zero } else { [Marshal]::StringToHGlobalUni($Password) }
@@ -15958,7 +15957,6 @@ function Validate-ProductKey {
     $KeyData = New-Object 'Byte[]' 13
     [Array]::Copy($bytes, 0, $KeyData, 0, [Math]::Min(13, $bytes.Length))
     $act_data = [Convert]::ToBase64String($KeyData)
-    # End of original Encode-KeyData logic
 
     $value = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $requestXml = @"
