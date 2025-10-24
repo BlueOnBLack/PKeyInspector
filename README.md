@@ -38,12 +38,5 @@
 - Update matrix: build update compatibility tables from XML datasets, including unsupported versions (offline).
 - Active license & settings view (OEM defaults, active SKU, and related metadata).
 - Activation/license management (RESEARCH‑ONLY / GATED): integration points for lab/test workflows.
-- Check Products keys against Official MS Server API, 3 Api In total
-  
----
+- Check Products keys against the Official MS Server API, 3 Api In total
 
-## Primary goals
-- Provide a single, searchable inventory of SKU/product metadata from `pkeyconfig` and vendor datasets.  
-- Produce audit‑ready reports in multiple export formats.  
-- Demonstrate how additional metadata can be surfaced using advanced low‑level techniques for authorized research and forensic analysis.  
-- Keep sensitive features gated, logged, and restricted to lab environments.
