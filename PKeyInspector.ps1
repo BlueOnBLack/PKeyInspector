@@ -24708,13 +24708,14 @@ function Get-SLLicensingStatus {
         $guidPattern = '^(?im)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         if ($SkuID -notmatch $guidPattern) {
             return $null  }
-
+        
+        $idx = -1
+        $pProductSkuId = $SkuID
+        $pAppID = $ApplicationID
         $pnStatusCount = [uint32]0
         $ppLicensingStatus = [IntPtr]::Zero
-        $pAppID = $ApplicationID
-        $pProductSkuId = $SkuID
 
-        $result = $global:slc::SLGetLicensingStatusInformation(
+        $ret = $global:slc::SLGetLicensingStatusInformation(
             $hSLC,
             [ref]$pAppID,
             [ref]$pProductSkuId,
@@ -24723,14 +24724,38 @@ function Get-SLLicensingStatus {
             [ref]$ppLicensingStatus
         )
 
-        $licensingInfo = $null
-
-        if ($result -eq 0 -and $pnStatusCount -gt 0 -and $ppLicensingStatus -ne [IntPtr]::Zero) {
-            $eStatus = [Marshal]::ReadInt32($ppLicensingStatus, 16)
-            $dwGraceTime = [Marshal]::ReadInt32($ppLicensingStatus, 20)
-            $dwTotalGraceDays = [Marshal]::ReadInt32($ppLicensingStatus, 24)
-            $hrReason = [Marshal]::ReadInt32($ppLicensingStatus, 28)
-            $qwValidityExpiration = [Marshal]::ReadInt64($ppLicensingStatus, 32)
+        if ($ret -eq 0 -and ($pnStatusCount -gt 0) -and ($ppLicensingStatus -ne [IntPtr]::Zero)) {
+            foreach ($Count in (0..($pnStatusCount-1))) {
+                
+                # Much better version, Cast Pointer to Structure
+                [Guid]$NewGuid = [Marshal]::PtrToStructure(
+                    ([IntPtr]::Add($ppLicensingStatus, ($Count * 0x28))),
+                    [type]'System.Guid'
+                )
+                if ([guid]::Equals($pProductSkuId, $NewGuid)) {
+                    $idx = $Count
+                    break;
+                }
+                
+                <#
+                [byte[]]$GuidBytes = New-Object byte[] 16
+                [Marshal]::Copy(
+                    [IntPtr]::Add($ppLicensingStatus, ($Count * 0x28)),
+                    $GuidBytes, 0, 16)
+                if ([guid]::Equals($pProductSkuId, ([GUID]::new([byte[]]$guidBytes)))) {
+                    $idx = $Count
+                    break;
+                }
+                #>
+        }}
+        if ($idx -ge 0) {
+            $licensingInfo = $null
+            $ppLicensingStatusPtr = [IntPtr]::Add($ppLicensingStatus, ($idx * 0x28))
+            $eStatus = [Marshal]::ReadInt32($ppLicensingStatusPtr, 16)
+            $dwGraceTime = [Marshal]::ReadInt32($ppLicensingStatusPtr, 20)
+            $dwTotalGraceDays = [Marshal]::ReadInt32($ppLicensingStatusPtr, 24)
+            $hrReason = [Marshal]::ReadInt32($ppLicensingStatusPtr, 28)
+            $qwValidityExpiration = [Marshal]::ReadInt64($ppLicensingStatusPtr, 32)
 
             if (($null -eq $eStatus) -or ($null -eq $dwGraceTime)) {
                 return $null
@@ -24740,13 +24765,14 @@ function Get-SLLicensingStatus {
             if ($qwValidityExpiration -gt 0) {
                 try {
                     $expirationDateTime = [DateTime]::FromFileTimeUtc($qwValidityExpiration)
-                } catch {}
+                } catch {
+                    # Handle potential exception
+                }
             }
 
             $now = Get-Date
             $graceExpirationDate = $now.AddMinutes($dwGraceTime)
             $graceUpToYear = $graceExpirationDate.Year
-
             $daysLeft = ($graceExpirationDate - $now).Days
             $year = $graceExpirationDate.Year
 
@@ -24755,14 +24781,11 @@ function Get-SLLicensingStatus {
             if ($licenseCategory -ieq 'Volume:GVLK') {
                 if ($year -gt 2038) {
                     $typeKMS = [LicenseCategory]::KMS4K
-                }
-                elseif ($year -in 2037, 2038) {
+                } elseif ($year -in 2037, 2038) {
                     $typeKMS = [LicenseCategory]::KMS38
-                }
-                elseif ($daysLeft -le 180 -and $daysLeft -ge 0) {
+                } elseif ($daysLeft -le 180 -and $daysLeft -ge 0) {
                     $typeKMS = [LicenseCategory]::ShortTermVL
-                }
-                else {
+                } else {
                     $typeKMS = [LicenseCategory]::Unknown
                 }
             } else {
