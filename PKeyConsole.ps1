@@ -2456,7 +2456,6 @@ function IsValid-IntPtr {
 
     return $false
 }
-
 function Free-IntPtr {
     param (
         [Parameter(Mandatory=$false)]
@@ -6186,6 +6185,176 @@ function Free-Variant {
         if ($bstrPtr -ne [IntPtr]::Zero) { [Marshal]::FreeBSTR($bstrPtr) }
     }
     [Marshal]::FreeHGlobal($variantPtr)
+}
+
+<#
+  A utility function for generating, converting, and comparing GUIDs.
+  Supports conversions between GUID, ByteArray, and Pointer formats.
+  Can also compare GUIDs for equality with different representations.
+  Example use.
+
+  Clear-Host
+  Write-Host
+  $Guid = Guid-Handler -Generate
+  $GuidPtr = Guid-Handler $Guid -OutputType Pointer
+  $GuidBytes = Guid-Handler $GuidPtr -OutputType ByteArray
+  $GuidNew = Guid-Handler $GuidBytes -OutputType Guid
+  Guid-Handler -InputData $GuidPtr -ReferenceData $GuidBytes -Compare
+  Write-Host
+  return
+#>
+function Guid-Handler {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, ValueFromPipeline = $true)]
+        [object]$InputData,
+
+        [Parameter(Position = 1)]
+        [object]$ReferenceData,
+
+        [Parameter(Position = 2)]
+        [ValidateSet("Guid", "ByteArray", "Pointer")]
+        [string]$OutputType,
+
+        [Parameter(Position = 3)]
+        [switch]$Generate,
+        [Parameter(Position = 4)]
+        [switch]$Compare
+    )
+
+    begin {
+        $GuidValue, $GuidBytes, $GuidPtr = `
+            $null, $null, $null
+        
+        $GuidValueNew, $GuidBytesNew, $GuidPtrNew = `
+            $null, $null, $null
+
+        Add-Type `
+            -AssemblyName System.Runtime.InteropServices
+    }
+
+    Process {
+        # Case New Guid
+        if ($Generate) {
+            if ($Compare -or $ReferenceData) {
+                Write-Error "can't combine -Compare and [-Generate or -ReferenceData]"
+                return
+            }
+           return [guid]::NewGuid()
+        }
+
+        if ($ReferenceData -and !$Compare) {
+            Write-Error "-ReferenceData must be used with -Compare"
+            return
+        }
+       
+        # Case Guid Value [Struct]
+        try {
+          if (!$GuidValue -or !$GuidBytes) {
+            [Guid]$GuidValue = $InputData
+            $GuidBytes = $GuidValue.ToByteArray()
+          }
+        } catch {}
+        
+        # Case Guid Bytes Array
+        try {
+          if (!$GuidValue -or !$GuidBytes) {
+            [byte[]]$GuidBytes = $InputData
+            try {
+              $GuidValue = [Guid]::new($GuidBytes)
+            } catch {
+              $GuidValue = [Activator]::CreateInstance([type]'System.Guid', $GuidBytes)
+            }
+          }
+        } catch {}
+        
+        # Case Guid Pointer
+        try {
+          if (!$GuidValue -or !$GuidBytes) {
+            [IntPtr]$GuidPtr = $InputData
+
+            if (!(IsValid-IntPtr $GuidPtr)) {
+                Write-Error "Pointer not valid"
+                return
+            }
+
+            # Alt` [Byte[]]::new(16) -or @(0) * 16
+            [byte[]]$GuidBytes = New-Object byte[] 16
+            [Marshal]::Copy($GuidPtr, $GuidBytes, 0, 16)
+
+            # Directly Case from Pointer, Work just fine.
+            # Avoid use [Guid]::new / [Activator]::CreateInstance
+            $GuidValue = [Marshal]::PtrToStructure(
+                $GuidPtr, [type][Guid]) # Or [type]'Guid'
+          }
+        } catch {}
+
+        # Case Equal
+        if ($Compare) {
+            if (!$ReferenceData) {
+                Write-Error "Must Provide ReferenceData Object"
+                return
+            }
+            try {
+              if (!$GuidValueNew -or !$GuidBytesNew) {
+                [Guid]$GuidValueNew = $ReferenceData
+                $GuidBytesNew = $GuidValueNew.ToByteArray()
+              }
+            } catch {}
+            try {
+              if (!$GuidValueNew -or !$GuidBytesNew) {
+                [byte[]]$GuidBytesNew = $ReferenceData
+                try {
+                  $GuidValueNew = [Guid]::new($GuidBytesNew)
+                } catch {
+                  $GuidValueNew = [Activator]::CreateInstance([type]'System.Guid', $GuidBytesNew)
+                }
+              }
+            } catch {}
+            try {
+              if (!$GuidValueNew -or !$GuidBytesNew) {
+                [IntPtr]$GuidPtrNew = $ReferenceData
+                if (!(IsValid-IntPtr $GuidPtrNew)) {
+                    Write-Error "Pointer not valid"
+                    return
+                }
+
+                # Alt` [Byte[]]::new(16) -or @(0) * 16
+                [byte[]]$GuidBytesNew = New-Object byte[] 16
+                [Marshal]::Copy($GuidPtrNew, $GuidBytesNew, 0, 16)
+
+                # Directly Case from Pointer, Work just fine.
+                # Avoid use [Guid]::new / [Activator]::CreateInstance
+                $GuidValueNew = [Marshal]::PtrToStructure(
+                    $GuidPtrNew, [type][Guid]) # Or [type]'Guid'
+              }
+            } catch {}
+            try {
+                $IsEqal = [Guid]::Equals($GuidValue, $GuidValueNew)
+                return $IsEqal
+            }
+            catch{}
+            return $false
+        }
+
+        # Return results
+        if ($OutputType -eq "Guid") {
+            return $GuidValue
+          }
+          elseif ($OutputType -eq "ByteArray") {
+            return $GuidBytes
+          }
+          elseif ($OutputType -eq "Pointer") {
+            $GuidPtr = if (IsValid-IntPtr $GuidPtr) {
+                $GuidPtr 
+            } else {
+                New-IntPtr -Data $GuidBytes 
+            }
+            return $GuidPtr
+          } else {
+            return $null
+        }
+    }
 }
 
 <#
@@ -18870,11 +19039,10 @@ function SL-InstallLicense {
             }
 
             if ($LicenseBlob) {
-                # Pin the current blob in memory
-                $blobPtr = [Marshal]::UnsafeAddrOfPinnedArrayElement($LicenseBlob, 0)
-        
-                # Call the installation API for the current LicenseBlob
+                # Pin the current blob in memory // use helper instead
+                $blobPtr = New-IntPtr -Data $LicenseBlob
                 $hrInstall = $Global:SLC::SLInstallLicense($hSLC, $LicenseBlob.Length, $blobPtr, [ref]$LicenseFileIdOut)
+                Free-IntPtr -handle $blobPtr -Method Auto
 
                 # Check if the installation was successful (HRESULT 0 means success)
                 if ($hrInstall -ne 0) {
