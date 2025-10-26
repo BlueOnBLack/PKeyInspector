@@ -2313,6 +2313,56 @@ function Parse-ErrorFacility {
     return [HRESULT_Facility]::FACILITY_UNKNOWN
 }
 
+<#
+.SYNOPSIS
+
+* Function Bor
+combine multiple Flags, with ease
+
+* Function Get-EnumFlags
+An Helper, to Extract Flags, Usage Example:
+Get-EnumFlags -EnumType ([CallingConventions]) -Value 33
+Get-EnumFlags -EnumType ([MethodAttributes]) -Value 1478
+#>
+Function Bor {
+    param ([int[]] $Array) 
+    $ret = $Array[0]
+    foreach ($item in $Array) {
+        $ret = $ret -bor $item
+    }
+    return [Int32]$ret
+}
+function Get-EnumFlags {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [Type] $EnumType,
+
+        [Parameter(Mandatory)]
+        $Value
+    )
+
+    # Convert to numeric
+    $numericValue = if ($Value -is $EnumType) {
+        [int]$Value
+    } else {
+        [int]$Value
+    }
+
+    # Correctly call static methods on a [Type] object
+    $names = [Enum]::GetNames($EnumType)
+
+    foreach ($name in $names) {
+        $enumValue = [int]([Enum]::Parse($EnumType, $name))
+        if (($numericValue -band $enumValue) -eq $enumValue) {
+            [PSCustomObject]@{
+                Name  = $name
+                Value = $enumValue
+            }
+        }
+    }
+}
+
 # WIN32 API Parts
 function Dump-MemoryAddress {
     param (
@@ -4929,6 +4979,374 @@ function Use-ComInterface {
     finally {
         $comObj | Release-ComObject
     }
+}
+
+<#
+.SYNOPSIS
+
+Creates an in-memory Interface for use in your PowerShell session.
+
+Based On example from Consumer_ESU_Enrollment.ps1
+https://github.com/abbodi1406/ConsumerESU/blob/master/Consumer_ESU_Enrollment.ps1
+
+.EXAMPLE
+
+Clear-Host
+Write-Host
+
+$ComObj = New-ComInterface `
+    -InterfaceName 'IEditionUpgradeManager' `
+    -Clsid '17CCA47D-DAE5-4E4A-AC42-CC54E28F334A' `
+    -IID 'F2DCB80D-0670-44BC-9002-CD18688730AF' `
+    -Fields @(
+        @{ name = 'Place_Holder' },
+        @{ name = 'Place_Holder' },
+        @{
+            Name = 'ShowProductKeyUI'
+            attributes = (Bor @(2,4,6,64,128,256,1024))
+            callingConvention = (Bor @(1,32))
+        },
+        @{
+            name = 'UpdateOperatingSystemWithParams'
+            attributes = (Bor @(2,4,6,64,128,256,1024))
+            callingConvention = (Bor @(1,32))
+            returnType = [Int32]
+            parameterTypes = @([string], [Int32], [Int32], [Int32])
+        }
+    )
+
+Invoke-ComInterface `
+    -ComObject $ComObj `
+    -Method ShowProductKeyUI `
+    -Params @()
+
+Invoke-ComInterface `
+    -ComObject $ComObj `
+    -Method UpdateOperatingSystemWithParams `
+    -Params @('QPM6N-7J2WJ-P88HH-P3YRH-YY74H', 0, 1, 0)
+
+[Marshal]::ReleaseComObject($ComObj.Instance) | Out-Null
+#>
+function New-ComInterface {
+    param(
+        [string]$InterfaceName,
+        [string]$Clsid,
+        [string]$IID,
+        [array]$Fields
+    )
+
+    $CAB = [System.Reflection.Emit.CustomAttributeBuilder]
+    $Module = ([AppDomain]::CurrentDomain.DefineDynamicAssembly(
+        (New-Object System.Reflection.AssemblyName "DynamicCOMAssembly"),
+        [System.Reflection.Emit.AssemblyBuilderAccess]::Run
+    )).DefineDynamicModule($InterfaceName, $false)
+
+    $ICom = $Module.DefineType($InterfaceName, 'Public, Interface, Abstract, Import')
+    $ICom.SetCustomAttribute($CAB::new([System.Runtime.InteropServices.ComImportAttribute].GetConstructor(@()), @()))
+    $ICom.SetCustomAttribute($CAB::new([System.Runtime.InteropServices.GuidAttribute].GetConstructor(@([String])), @($IID)))
+    $ICom.SetCustomAttribute($CAB::new([System.Runtime.InteropServices.InterfaceTypeAttribute].GetConstructor(@([Int16])), @([Int16]1)))
+    foreach ($Field in $Fields) {
+        if (!($Field.ContainsKey('Name'))) {
+            Write-error "Fields contain bad parameters .!"
+            return
+        }
+
+        $name              = $Field.Name
+        $attributes        = if ($Field.ContainsKey('attributes')) { $Field.attributes } else { Bor @(64,1024) }
+        $callingConvention = if ($Field.ContainsKey('callingConvention')) { $Field.callingConvention } else { 1 }
+        $returnType        = if ($Field.ContainsKey('returnType')) { $Field.returnType } else { [Void] }
+        $parameterTypes    = if ($Field.ContainsKey('parameterTypes')) { $Field.parameterTypes } else { $null }
+        [void]$ICom.DefineMethod( $name, $attributes, $callingConvention, $returnType, $parameterTypes )
+    }
+
+    $InterfaceType = $ICom.CreateType()
+    $ComObj = [Activator]::CreateInstance([Type]::GetTypeFromCLSID($Clsid))
+    return [PsObject]@{
+        InterfaceType = $InterfaceType
+        Instance      = $ComObj
+    }
+}
+function Invoke-ComInterface {
+    param(
+        [Parameter(Mandatory)]
+        $ComObject,
+        [Parameter(Mandatory)]
+        [string]$Method,
+        [Parameter()]
+        [object[]]$Params = $null,
+        [switch]$Release
+    )
+
+    try {
+        if (-not $ComObject.InterfaceType -or -not $ComObject.Instance) {
+            throw "Invalid COM interface object. Expected output from New-ComInterface."
+        }
+
+        $methodInfo = $ComObject.InterfaceType.GetMethod($Method)
+        if (-not $methodInfo) {
+            throw "Method '$Method' not found on interface '$($ComObject.InterfaceType.FullName)'."
+        }
+
+        $result = $methodInfo.Invoke($ComObject.Instance, $Params)
+        return $result
+    }
+    catch {
+        Write-Error $_
+    }
+    finally {
+        if ($Release) {
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObject.Instance) | Out-Null
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+
+Creates an in-memory struct for use in your PowerShell session.
+
+Author: Matthew Graeber (@mattifestation)
+License: BSD 3-Clause
+Required Dependencies: None
+Optional Dependencies: field
+
+.EXAMPLE
+
+Clear-Host
+Write-Host
+
+# Example struct, IMAGE_DOS_HEADER
+New-Struct `
+    -Module (New-InMemoryModule -ModuleName Win32) `
+    -FullName IMAGE_DOS_HEADER `
+    -StructFields @{
+        e_magic =    New-field 0 UInt16
+        e_cblp =     New-field 1 UInt16
+        e_cp =       New-field 2 UInt16
+        e_crlc =     New-field 3 UInt16
+        e_cparhdr =  New-field 4 UInt16
+        e_minalloc = New-field 5 UInt16
+        e_maxalloc = New-field 6 UInt16
+        e_ss =       New-field 7 UInt16
+        e_sp =       New-field 8 UInt16
+        e_csum =     New-field 9 UInt16
+        e_ip =       New-field 10 UInt16
+        e_cs =       New-field 11 UInt16
+        e_lfarlc =   New-field 12 UInt16
+        e_ovno =     New-field 13 UInt16
+        e_res =      New-field 14 UInt16[] -MarshalAs @('ByValArray', 4)
+        e_oemid =    New-field 15 UInt16
+        e_oeminfo =  New-field 16 UInt16
+        e_res2 =     New-field 17 UInt16[] -MarshalAs @('ByValArray', 10)
+        e_lfanew =   New-field 18 Int32
+    } | Out-Null
+
+# Example of using an explicit layout in order to create a union.
+New-struct `
+    -Module (New-InMemoryModule -ModuleName Win32) `
+    -FullName TestUnion  `
+    -StructFields @{
+        field1 = New-field 0 UInt32 0
+        field2 = New-field 1 IntPtr 0
+    } -ExplicitLayout | Out-Null
+
+# Example struct, UNICODE_STRING
+New-Struct `
+    -Module (New-InMemoryModule -ModuleName UCICODE_HELPER) `
+    -FullName UNICODE_STRING `
+    -StructFields @{
+        Length        = New-field 0 UInt16
+        MaximumLength = New-field 1 UInt16
+        Buffer        = New-field 2 IntPtr
+    } | Out-Null
+
+## Using GetSize & Casting
+$header = New-Object([IMAGE_DOS_HEADER]); $header.e_cs = 2;
+$headerPtr = New-IntPtr -Data (New-Object byte[] ([IMAGE_DOS_HEADER]::GetSize()))
+[marshal]::StructureToPtr($header, $headerPtr, $false)
+$header = [IMAGE_DOS_HEADER]$headerPtr
+Write-Host ("Is Same ? {0}" -f ($header.e_cs -eq 2))
+
+## Using SizeOf & PtrToStructure
+$stringPtr = New-IntPtr ([Marshal]::SizeOf([Type][UNICODE_STRING]))
+[marshal]::WriteInt16($stringPtr, 0x00, 0x08)
+[marshal]::WriteInt16($stringPtr, 0x02, 0x0a)
+[marshal]::WriteIntPtr($stringPtr, [IntPtr]::Size, ([Marshal]::StringToHGlobalUni('Test')))
+$stringInfo = Parse-NativeString -StringPtr $stringPtr -Encoding Unicode
+write-host "Parse-NativeString : $($stringInfo | select -ExpandProperty StringData)" -ForegroundColor Green
+$string = [marshal]::PtrToStructure($stringPtr, [Type][UNICODE_STRING])
+write-host "PtrToStructure     : $([Marshal]::PtrToStringUni($string.Buffer))" -ForegroundColor Green
+Free-NativeString -StringPtr $stringPtr
+#>
+function New-InMemoryModule {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    Param (
+        [Parameter(Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $ModuleName = [Guid]::NewGuid().ToString()
+    )
+
+    $AppDomain = [Reflection.Assembly].Assembly.GetType('System.AppDomain').GetProperty('CurrentDomain').GetValue($null, @())
+    $LoadedAssemblies = $AppDomain.GetAssemblies()
+
+    foreach ($Assembly in $LoadedAssemblies) {
+        if ($Assembly.FullName -and ($Assembly.FullName.Split(',')[0] -eq $ModuleName)) {
+            return $Assembly
+        }
+    }
+
+    $DynAssembly = New-Object Reflection.AssemblyName($ModuleName)
+    $Domain = $AppDomain
+    $AssemblyBuilder = $Domain.DefineDynamicAssembly($DynAssembly, 'Run')
+    $ModuleBuilder = $AssemblyBuilder.DefineDynamicModule($ModuleName, $False)
+
+    return $ModuleBuilder
+}
+function New-field {
+    Param (
+        [Parameter(Position = 0, Mandatory=$True)]
+        [UInt16]
+        $Position,
+
+        [Parameter(Position = 1, Mandatory=$True)]
+        [Type]
+        $Type,
+
+        [Parameter(Position = 2)]
+        [UInt16]
+        $Offset,
+
+        [Object[]]
+        $MarshalAs
+    )
+
+    @{
+        Position = $Position
+        Type = $Type -as [Type]
+        Offset = $Offset
+        MarshalAs = $MarshalAs
+    }
+}
+function New-Struct {
+    [OutputType([Type])]
+    Param (
+        [Parameter(Position = 1, Mandatory=$True)]
+        [ValidateScript({($_ -is [Reflection.Emit.ModuleBuilder]) -or ($_ -is [Reflection.Assembly])})]
+        $Module,
+
+        [Parameter(Position = 2, Mandatory=$True)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $FullName,
+
+        [Parameter(Position = 3, Mandatory=$True)]
+        [ValidateNotNullOrEmpty()]
+        [Hashtable]
+        $StructFields,
+
+        [Reflection.Emit.PackingSize]
+        $PackingSize = [Reflection.Emit.PackingSize]::Unspecified,
+
+        [Switch]
+        $ExplicitLayout
+    )
+
+    if ($Module -is [Reflection.Assembly])
+    {
+        return ($Module.GetType($FullName))
+    }
+
+    [Reflection.TypeAttributes] $StructAttributes = bor @(0,1,256,1048576)
+    if ($ExplicitLayout)
+    {
+        $StructAttributes = $StructAttributes -bor [Reflection.TypeAttributes]::ExplicitLayout
+    }
+    else
+    {
+        $StructAttributes = $StructAttributes -bor [Reflection.TypeAttributes]::SequentialLayout
+    }
+
+    $StructBuilder = $Module.DefineType($FullName, $StructAttributes, [ValueType], $PackingSize)
+    $ConstructorInfo = [Runtime.InteropServices.MarshalAsAttribute].GetConstructors()[0]
+    $SizeConst = @([Runtime.InteropServices.MarshalAsAttribute].GetField('SizeConst'))
+
+    $Fields = New-Object Hashtable[]($StructFields.Count)
+
+    # Sort each field according to the orders specified
+    # Unfortunately, PSv2 doesn't have the luxury of the
+    # hashtable [Ordered] accelerator.
+    foreach ($Field in $StructFields.Keys)
+    {
+        $Index = $StructFields[$Field]['Position']
+        $Fields[$Index] = @{FieldName = $Field; Properties = $StructFields[$Field]}
+    }
+
+    foreach ($Field in $Fields)
+    {
+        $FieldName = $Field['FieldName']
+        $FieldProp = $Field['Properties']
+
+        $Offset = $FieldProp['Offset']
+        $Type = $FieldProp['Type']
+        $MarshalAs = $FieldProp['MarshalAs']
+
+        $NewField = $StructBuilder.DefineField($FieldName, $Type, 'Public')
+
+        if ($MarshalAs)
+        {
+            $UnmanagedType = $MarshalAs[0] -as ([Runtime.InteropServices.UnmanagedType])
+            if ($MarshalAs[1])
+            {
+                $Size = $MarshalAs[1]
+                $AttribBuilder = New-Object Reflection.Emit.CustomAttributeBuilder($ConstructorInfo,
+                    $UnmanagedType, $SizeConst, @($Size))
+            }
+            else
+            {
+                $AttribBuilder = New-Object Reflection.Emit.CustomAttributeBuilder($ConstructorInfo, [Object[]] @($UnmanagedType))
+            }
+
+            $NewField.SetCustomAttribute($AttribBuilder)
+        }
+
+        if ($ExplicitLayout) { $NewField.SetOffset($Offset) }
+    }
+
+    # Make the struct aware of its own size.
+    # No more having to call [Runtime.InteropServices.Marshal]::SizeOf!
+    $SizeMethod = $StructBuilder.DefineMethod('GetSize',
+        'Public, Static',
+        [Int],
+        [Type[]] @())
+    $ILGenerator = $SizeMethod.GetILGenerator()
+    # Thanks for the help, Jason Shirk!
+    $ILGenerator.Emit([Reflection.Emit.OpCodes]::Ldtoken, $StructBuilder)
+    $ILGenerator.Emit([Reflection.Emit.OpCodes]::Call,
+        [Type].GetMethod('GetTypeFromHandle'))
+    $ILGenerator.Emit([Reflection.Emit.OpCodes]::Call,
+        [Runtime.InteropServices.Marshal].GetMethod('SizeOf', [Type[]] @([Type])))
+    $ILGenerator.Emit([Reflection.Emit.OpCodes]::Ret)
+
+    # Allow for explicit casting from an IntPtr
+    # No more having to call [Runtime.InteropServices.Marshal]::PtrToStructure!
+    $ImplicitConverter = $StructBuilder.DefineMethod('op_Implicit',
+        'PrivateScope, Public, Static, HideBySig, SpecialName',
+        $StructBuilder,
+        [Type[]] @([IntPtr]))
+    $ILGenerator2 = $ImplicitConverter.GetILGenerator()
+    $ILGenerator2.Emit([Reflection.Emit.OpCodes]::Nop)
+    $ILGenerator2.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+    $ILGenerator2.Emit([Reflection.Emit.OpCodes]::Ldtoken, $StructBuilder)
+    $ILGenerator2.Emit([Reflection.Emit.OpCodes]::Call,
+        [Type].GetMethod('GetTypeFromHandle'))
+    $ILGenerator2.Emit([Reflection.Emit.OpCodes]::Call,
+        [Runtime.InteropServices.Marshal].GetMethod('PtrToStructure', [Type[]] @([IntPtr], [Type])))
+    $ILGenerator2.Emit([Reflection.Emit.OpCodes]::Unbox_Any, $StructBuilder)
+    $ILGenerator2.Emit([Reflection.Emit.OpCodes]::Ret)
+
+    $StructBuilder.CreateType()
 }
 
 <#
