@@ -25338,29 +25338,29 @@ function Get-SLLicensingStatus {
     }
 
     # region --- Handle management ---
-    if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero) {
-        $hSLC = if ($global:hSLC_ -and $global:hSLC_ -ne [IntPtr]::Zero) {
+    if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero -or $hSLC -eq 0) {
+        $hSLC = if ($global:hSLC_ -and $global:hSLC_ -ne [IntPtr]::Zero -and $global:hSLC_ -ne 0) {
             $global:hSLC_
         } else {
             Manage-SLHandle
         }
     }
-    # endregion
 
-    $closeHandle = $false
     try {
-        if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero) {
+        $closeHandle = $true
+        if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero -or $hSLC -eq 0) {
             $hr = $Global:SLC::SLOpen([ref]$hSLC)
             if ($hr -ne 0) {
                 throw "SLOpen failed: HRESULT 0x{0:X8}" -f $hr
             }
-            $closeHandle = $true
+        } else {
+            $closeHandle = $false
         }
     }
     catch {
-        Write-Warning "Failed to open SLC handle: $_"
         return $null
     }
+    # endregion
 
     # region --- Define struct if not already loaded ---
     if (-not ([PSTypeName]'SL_LICENSING_STATUS').Type) {
