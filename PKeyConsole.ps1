@@ -13683,12 +13683,20 @@ $ApiMapList = @(
 
     # Activation errors
     "slc.dll",
-    "sppc.dll"
+    "sppc.dll",
 
     # Network Management errors
-    "netmsg.dll",  # Network
-    "winhttp.dll", # HTTP SERVICE
-    "qmgr.dll"     # BITS
+    "netmsg.dll",   # Network
+    "winhttp.dll",  # HTTP SERVICE
+    "qmgr.dll",     # BITS
+
+    # WMI related DLL
+    "wmiutils.dll",
+    "wbemcore.dll",
+    "wbemcntl.dll",
+
+    # OLE related DLL
+    "MSDAERR.dll"
 )
 $baseMap = @{}
 $global:LoadedModules = Get-LoadedModules -SortType Memory | 
@@ -13696,14 +13704,16 @@ $global:LoadedModules = Get-LoadedModules -SortType Memory |
 $LoadedModules | Where-Object { $ApiMapList -contains $_.ModuleName } | 
     ForEach-Object { $baseMap[$_.ModuleName] = $_.BaseAddress
 }
-$flags = [LOAD_LIBRARY]::SEARCH_SYS32
 $ApiMapList | Where-Object { $_ -notin $baseMap.Keys } | ForEach-Object {   
-    $HResults = Ldr-LoadDll -dwFlags $flags -dll $_
+    $HResults = Ldr-LoadDll -dwFlags SEARCH_SYS32 -dll $_
     if ($HResults -ne [IntPtr]::Zero) {
         write-warning "LdrLoadDll Succedded to load $_"
     }
     else {
-        write-warning "LdrLoadDll failed to load $_"
+        $HResults = Ldr-LoadDll -dwFlags ALTERED_SEARCH -dll $_
+        if ($HResults -eq [IntPtr]::Zero) {
+            write-warning "LdrLoadDll failed to load $_"
+        }
     }
     if ([IntPtr]::Zero -ne $HResults) {
         $baseMap[$_] = $HResults
