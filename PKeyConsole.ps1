@@ -1590,17 +1590,19 @@ Write-Host "Testing *** BOR CASE" -ForegroundColor Green
 Write-Host "WIN32 -bor HRESULT -bor NTSTATUS" -ForegroundColor Green
 Parse-ErrorMessage -log -MessageId 0x00030206 -Flags ([ErrorMessageType]::WIN32 -bor [ErrorMessageType]::NTSTATUS -bor [ErrorMessageType]::HRESULT)
 #>
-enum ErrorMessageType {
-    WIN32      = 1
-    NTSTATUS   = 2
-    ACTIVATION = 4
-    NETWORK    = 8
-    CBS        = 16
-    BITS       = 32
-    HTTP       = 64
-    UPDATE     = 128
-    HRESULT    = 256
-    ALL        = 511
+Enum ErrorMessageType {
+    ALL         = 0
+    WIN32       = 1
+    NTSTATUS    = 2
+    ACTIVATION  = 4
+    NETWORK     = 8
+    CBS         = 16
+    BITS        = 32
+    HTTP        = 64
+    UPDATE      = 128
+    HRESULT     = 256
+    WMI         = 512
+    OLE         = 1024
 }
 function Parse-MessageId {
     param (
@@ -1770,7 +1772,9 @@ function Parse-ErrorMessage {
                  [ErrorMessageType]::BITS       -bor `
                  [ErrorMessageType]::HTTP       -bor `
                  [ErrorMessageType]::UPDATE     -bor `
-                 [ErrorMessageType]::HRESULT
+                 [ErrorMessageType]::HRESULT    -bor `
+                 [ErrorMessageType]::WMI        -bor `
+                 [ErrorMessageType]::OLE
     }
     foreach ($Flag in [Enum]::GetValues([ErrorMessageType]) | Where-Object { $_ -ne [ErrorMessageType]::ALL }) {
             $isValueExist = ($Flags -band $flag) -eq $flag
@@ -1783,6 +1787,8 @@ function Parse-ErrorMessage {
                     ([ErrorMessageType]::HRESULT)      { $apiList += "KernelBase.dll","Kernel32.dll"}  #,"api-ms-win-core-synch-l1-2-0.dll" }
                     ([ErrorMessageType]::NTSTATUS)     { $apiList += "ntdll.dll" }
                     ([ErrorMessageType]::ACTIVATION)   { $apiList += "slc.dll", "sppc.dll"}
+                    ([ErrorMessageType]::WMI)          { $apiList += "wmiutils.dll", "wbemcore.dll", "wbemcntl.dll" }
+                    ([ErrorMessageType]::OLE)          { $apiList += "MSDAERR.dll" }
                 }
             }
     }
@@ -2898,7 +2904,7 @@ Function Init-SLC {
                 Parameters = @(
                     [IntPtr],                     # hSLC (HSLC handle)
                     [GUID].MakeByRefType(),       # pAppID (const SLID * - pass [IntPtr]::Zero or allocated GUID)
-                    [GUID].MakeByRefType(),       # pProductSkuId (const SLID * - pass [IntPtr]::Zero or allocated GUID)
+                    [IntPtr],                     # pProductSkuId (const SLID * - pass [IntPtr]::Zero or allocated GUID)
                     [IntPtr],                     # pwszRightName (PCWSTR - pass [IntPtr]::Zero for NULL)
                     [uint32].MakeByRefType(),     # pnStatusCount (UINT *)
                     [IntPtr].MakeByRefType()      # ppLicensingStatus (SL_LICENSING_STATUS **)
@@ -5020,6 +5026,23 @@ Invoke-ComInterface `
     -Params @('QPM6N-7J2WJ-P88HH-P3YRH-YY74H', 0, 1, 0)
 
 [Marshal]::ReleaseComObject($ComObj.Instance) | Out-Null
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+# Alternative Way. [Call to A Specific Function] #
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+Use-ComInterface `
+    -Clsid '17CCA47D-DAE5-4E4A-AC42-CC54E28F334A' `
+    -IID 'F2DCB80D-0670-44BC-9002-CD18688730AF' `
+    -Index 3 `
+    -Name ShowProductKeyUI
+
+Use-ComInterface `
+    -Clsid '17CCA47D-DAE5-4E4A-AC42-CC54E28F334A' `
+    -IID 'F2DCB80D-0670-44BC-9002-CD18688730AF' `
+    -Index 4 `
+    -Name UpdateOperatingSystemWithParams `
+    -Values @('QPM6N-7J2WJ-P88HH-P3YRH-YY74H', 0, 1, 0)
 #>
 function New-ComInterface {
     param(
@@ -19611,7 +19634,26 @@ function SL-UninstallLicense {
 .SYNOPSIS
 Retrieves Software Licensing Client status for application and product SkuID.
 
-Example:
+Example <1>
+
+Clear-Host
+Write-Host
+
+#Default Guid For Windows & Office
+$windowsAppID = '55c92734-d682-4d71-983e-d6ec3f16059f'
+$OfficeAppId  = '0ff1ce15-a989-479d-af46-f275c6370663'
+
+# Get All Sku Per Application Id
+#Get-SLLicensingStatus  # default $windowsAppID
+#Get-SLLicensingStatus $windowsAppID
+#Get-SLLicensingStatus $OfficeAppId
+
+# Get SkuiId info Of 'ed655016-a9e8-4434-95d9-4345352c2552'
+#Get-SLLicensingStatus $null ed655016-a9e8-4434-95d9-4345352c2552
+#Get-SLLicensingStatus $windowsAppID ed655016-a9e8-4434-95d9-4345352c2552
+
+Example <2>
+
 $LicensingProducts = (
     Get-SLIDList -eQueryIdType SL_ID_APPLICATION -eReturnIdType SL_ID_PRODUCT_SKU -pQueryId $windowsAppID | ? { Retrieve-SKUInfo -SkuId $_ -eReturnIdType SL_ID_PKEY }
     ) | % {
@@ -19664,152 +19706,185 @@ enum LicenseCategory {
 function Get-SLLicensingStatus {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true)]
-        [ValidateSet("55c92734-d682-4d71-983e-d6ec3f16059f", "0ff1ce15-a989-479d-af46-f275c6370663")]
-        [Guid]$ApplicationID,
-
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [Guid]$SkuID,
-
-        [Parameter(Mandatory=$false)]
+        [Nullable[Guid]]$ApplicationID = $null,
+        [Nullable[Guid]]$SkuID = $null,
         [Intptr]$hSLC = [IntPtr]::Zero
     )
 
-    if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero -or $hSLC -eq 0) {
-        $hSLC = if ($global:hSLC_ -and $global:hSLC_ -ne [IntPtr]::Zero -and $global:hSLC_ -ne 0) {
+    function Test-Guid {
+        [CmdletBinding()]
+        param (
+            [Parameter(ValueFromPipeline, ValueFromPipelineByPropertyName)]
+            [object] $Value
+        )
+        process {
+            if (-not $Value) { return $false }
+            try {
+                $guid = [Guid]::Parse($Value.ToString())
+                return ($guid -ne [Guid]::Empty)
+            } catch { return $false }
+        }
+    }
+
+    # Or both null, Or both same,
+    # but If one exist, we can handle things
+    # $ApplicationID & [Optional: $skuId]
+    # But even with just $skuId, we can get -> $ApplicationID
+    # And still continue
+
+    if ([Guid]::Equals($SkuID, $ApplicationID)) {
+        $ApplicationID = Guid-Handler '55c92734-d682-4d71-983e-d6ec3f16059f' $null Guid
+    }
+    if (!(Test-Guid $ApplicationID)) {
+        try {
+            $ApplicationID = Retrieve-SKUInfo -SkuId $SkuID -eReturnIdType SL_ID_APPLICATION
+        }
+        catch {
+        }
+        if (!(Test-Guid $ApplicationID)) {
+            return $null
+        }
+    }
+
+    # region --- Handle management ---
+    if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero) {
+        $hSLC = if ($global:hSLC_ -and $global:hSLC_ -ne [IntPtr]::Zero) {
             $global:hSLC_
         } else {
             Manage-SLHandle
         }
     }
+    # endregion
 
+    $closeHandle = $false
     try {
-        $closeHandle = $true
-        if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero -or $hSLC -eq 0) {
+        if (-not $hSLC -or $hSLC -eq [IntPtr]::Zero) {
             $hr = $Global:SLC::SLOpen([ref]$hSLC)
             if ($hr -ne 0) {
                 throw "SLOpen failed: HRESULT 0x{0:X8}" -f $hr
             }
-        } else {
-            $closeHandle = $false
+            $closeHandle = $true
         }
     }
     catch {
+        Write-Warning "Failed to open SLC handle: $_"
         return $null
     }
 
-    try {
-        $guidPattern = '^(?im)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-        if ($SkuID -notmatch $guidPattern) {
-            return $null  }
-        
-        $idx = -1
-        $pProductSkuId = $SkuID
-        $pAppID = $ApplicationID
-        $pnStatusCount = [uint32]0
-        $ppLicensingStatus = [IntPtr]::Zero
+    # region --- Define struct if not already loaded ---
+    if (-not ([PSTypeName]'SL_LICENSING_STATUS').Type) {
+        New-Struct `
+            -Module (New-InMemoryModule -ModuleName SL_LICENSING_STATUS) `
+            -FullName SL_LICENSING_STATUS `
+            -StructFields @{
+                SkuId                = New-field 0 Guid
+                eStatus              = New-field 1 Int32
+                dwGraceTime          = New-field 2 UInt32
+                dwTotalGraceDays     = New-field 3 UInt32
+                hrReason             = New-field 4 Int32
+                qwValidityExpiration = New-field 5 UInt64
+            } | Out-Null
+    }
+    # endregion
 
-        $ret = $global:slc::SLGetLicensingStatusInformation(
+    try {
+        # region --- Call SL API ---
+        $pAppID = [Guid]$ApplicationID
+        $pSkuId = if (!$SkuID -or $SkuID -eq [Guid]::Empty) { [IntPtr]::Zero } else { Guid-Handler $SkuID $null Pointer }
+        $pnCount = [uint32]0
+        $ppStatus = [IntPtr]::Zero
+
+        $result = $global:slc::SLGetLicensingStatusInformation(
             $hSLC,
             [ref]$pAppID,
-            [ref]$pProductSkuId,
+            $pSkuId,
             [IntPtr]::Zero,
-            [ref]$pnStatusCount,
-            [ref]$ppLicensingStatus
+            [ref]$pnCount,
+            [ref]$ppStatus
         )
 
-        if ($ret -eq 0 -and ($pnStatusCount -gt 0) -and ($ppLicensingStatus -ne [IntPtr]::Zero)) {
-            foreach ($Count in (0..($pnStatusCount-1))) {
-                
-                # Much better version, Cast Pointer to Structure
-                [Guid]$NewGuid = [Marshal]::PtrToStructure(
-                    ([IntPtr]::Add($ppLicensingStatus, ($Count * 0x28))),
-                    [type]'System.Guid'
-                )
-                if ([guid]::Equals($pProductSkuId, $NewGuid)) {
-                    $idx = $Count
-                    break;
-                }
-                
-                <#
-                [byte[]]$GuidBytes = New-Object byte[] 16
-                [Marshal]::Copy(
-                    [IntPtr]::Add($ppLicensingStatus, ($Count * 0x28)),
-                    $GuidBytes, 0, 16)
-                if ([guid]::Equals($pProductSkuId, ([GUID]::new([byte[]]$guidBytes)))) {
-                    $idx = $Count
-                    break;
-                }
-                #>
-        }}
-        if ($idx -ge 0) {
-            $licensingInfo = $null
-            $ppLicensingStatusPtr = [IntPtr]::Add($ppLicensingStatus, ($idx * 0x28))
-            $eStatus = [Marshal]::ReadInt32($ppLicensingStatusPtr, 16)
-            $dwGraceTime = [Marshal]::ReadInt32($ppLicensingStatusPtr, 20)
-            $dwTotalGraceDays = [Marshal]::ReadInt32($ppLicensingStatusPtr, 24)
-            $hrReason = [Marshal]::ReadInt32($ppLicensingStatusPtr, 28)
-            $qwValidityExpiration = [Marshal]::ReadInt64($ppLicensingStatusPtr, 32)
+        Free-IntPtr $pSkuId
+        # endregion
 
-            if (($null -eq $eStatus) -or ($null -eq $dwGraceTime)) {
-                return $null
-            }
+        if ($result -ne 0 -or $pnCount -le 0 -or $ppStatus -eq [IntPtr]::Zero) {
+            Write-Warning "SLGetLicensingStatusInformation returned 0x{0:X8}" -f $result
+            return $null
+        }
 
-            $expirationDateTime = $null
-            if ($qwValidityExpiration -gt 0) {
-                try {
-                    $expirationDateTime = [DateTime]::FromFileTimeUtc($qwValidityExpiration)
-                } catch {
-                    # Handle potential exception
-                }
-            }
+        # region --- Build results ---
+        $blockSize = [Marshal]::SizeOf([Type][SL_LICENSING_STATUS])
+        $LicensingStatusArr = New-Object SL_LICENSING_STATUS[] $pnCount
 
-            $now = Get-Date
-            $graceExpirationDate = $now.AddMinutes($dwGraceTime)
-            $graceUpToYear = $graceExpirationDate.Year
-            $daysLeft = ($graceExpirationDate - $now).Days
-            $year = $graceExpirationDate.Year
+        for ($i = 0; $i -lt $pnCount; $i++) {
+            $ptr = [IntPtr]::Add($ppStatus, $i * $blockSize)
+            $LicensingStatusArr[$i] = [SL_LICENSING_STATUS]$ptr
+        }
 
-            $licenseCategory = $Global:PKeyDatabase | Where-Object { $_.ActConfigId -eq "{$skuId}" } | Select-Object -First 1 -ExpandProperty ProductKeyType
+        # If specific SKU requested, return that one
+        if (Test-Guid $SkuID) {
+            $Status = $LicensingStatusArr | Where-Object { $_.SkuId -eq $SkuID } | Select-Object -First 1
+            if (-not $Status) { return $null }    
+        } else {
+            return $LicensingStatusArr
+        }
+        # endregion
 
-            if ($licenseCategory -ieq 'Volume:GVLK') {
-                if ($year -gt 2038) {
+        # region --- Process single SKU ---
+        $expirationDateTime = $null
+        if ($Status.qwValidityExpiration -gt 0) {
+            try {
+                $expirationDateTime = [DateTime]::FromFileTimeUtc($Status.qwValidityExpiration)
+            } catch { }
+        }
+
+        $now = Get-Date
+        $graceExpiration = $now.AddMinutes($Status.dwGraceTime)
+        $daysLeft = ($graceExpiration - $now).Days
+
+        $licenseCategory = $Global:PKeyDatabase |
+            Where-Object ActConfigId -eq "{$SkuID}" |
+            Select-Object -First 1 -ExpandProperty ProductKeyType
+        switch -Regex ($licenseCategory) {
+            'Volume:GVLK' {
+                if ($graceExpiration.Year -gt 2038) {
                     $typeKMS = [LicenseCategory]::KMS4K
-                } elseif ($year -in 2037, 2038) {
+                } elseif ($graceExpiration.Year -in 2037, 2038) {
                     $typeKMS = [LicenseCategory]::KMS38
                 } elseif ($daysLeft -le 180 -and $daysLeft -ge 0) {
                     $typeKMS = [LicenseCategory]::ShortTermVL
                 } else {
                     $typeKMS = [LicenseCategory]::Unknown
                 }
-            } else {
-                $typeKMS = [LicenseCategory]::NonKMS
             }
-
-            $errorMessage = Parse-ErrorMessage -MessageId $hrReason -Flags ACTIVATION
-            $hrHex = '0x{0:X8}' -f ($hrReason -band 0xFFFFFFFF)
-
-            return [PSCustomObject]@{
-                ID                   = $SkuID
-                LicenseStatus        = [LicenseStatusEnum]$eStatus
-                GracePeriodRemaining = $dwGraceTime
-                TotalGraceDays       = $dwTotalGraceDays
-                EvaluationEndDate    = $expirationDateTime
-                LicenseStatusReason  = $hrHex
-                LicenseChannel       = $licenseCategory
-                LicenseTier          = $typeKMS
-                ApiCallHResult       = '0x{0:X8}' -f $result
-                ErrorMessege         = $errorMessage
-            }
+            default { $typeKMS = [LicenseCategory]::NonKMS }
         }
+
+        $errorMessage = Parse-ErrorMessage -MessageId $Status.hrReason -Flags ACTIVATION
+        $hrHex = '0x{0:X8}' -f ($Status.hrReason -band 0xFFFFFFFF)
+
+        $StatusObj = [PsObject]@{
+            ID                   = $Status.SkuID
+            LicenseStatus        = [Enum]::GetName([LicenseStatusEnum], $Status.eStatus)
+            GracePeriodRemaining = $Status.dwGraceTime
+            TotalGraceDays       = $Status.dwTotalGraceDays
+            EvaluationEndDate    = $expirationDateTime
+            LicenseStatusReason  = $hrHex
+            LicenseChannel       = $licenseCategory
+            LicenseTier          = $typeKMS
+            ApiCallHResult       = ('0x{0:X8}' -f $result)
+            ErrorMessage         = $errorMessage
+        }
+        return $StatusObj
+        # endregion
     }
-    catch{}
+    catch {
+        Write-Warning "Error while retrieving licensing info: $_"
+        return $null
+    }
     finally {
-        
-        Free-IntPtr -handle $ppLicensingStatus -Method Local
+        Free-IntPtr -handle $ppStatus -Method Local
         if ($closeHandle) {
-            Write-Warning "Consider Open handle Using Manage-SLHandle"
+            Write-Warning "Releasing temporary SLC handle"
             Free-IntPtr -handle $hSLC -Method License
         }
     }
