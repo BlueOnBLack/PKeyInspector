@@ -27,6 +27,14 @@ Add-Type -AssemblyName System.Windows.Forms
 
 $ProgressPreference = 'SilentlyContinue'
 
+Import-Module NtObjectManager -ErrorAction SilentlyContinue
+if (!(Get-Module -Name NtObjectManager)) {
+    Install-Module NtObjectManager -Force -ErrorAction SilentlyContinue
+    Import-Module NtObjectManager -ErrorAction SilentlyContinue
+}
+if (!([PSTypeName]'NtCoreLib.NtToken').Type) {
+    Write-warning 'NtObjectManager types cant be found!'
+}
 
 # ***************************** #
 #       Scripts etc etc etc     #
@@ -2366,6 +2374,267 @@ function Get-EnumFlags {
                 Value = $enumValue
             }
         }
+    }
+}
+
+<#
+.SYNOPSIS
+Just a little helper, 
+to convert String, or values into Sid
+or Print it later if needed
+
+Examples.
+
+# S-1-5-32-544, Administrators
+$pSid = Sid-Helper -Rev 1 -Auth 5 -Subs @(32, 544)
+Sid-Helper -pSid $pSid
+Free-IntPtr $pSid
+
+# S-1-5-32-556, DOMAIN_ALIAS_RID_NETWORK_CONFIGURATION_OPS
+$pSid = Sid-Helper `
+    -pValue 'S-1-5-32-556' `
+    -Api RtlInitializeSid -UseApi
+Sid-Helper -pSid $pSid
+Free-IntPtr $pSid
+
+# S-1-5-32-557, DOMAIN_ALIAS_RID_INCOMING_FOREST_TRUST_BUILDERS
+$pSid = Sid-Helper `
+    -pValue 'S-1-5-32-557' `
+    -Api RtlInitializeSidEx -UseApi
+Sid-Helper -pSid $pSid
+Free-IntPtr $pSid
+
+# S-1-5-32-552, Replicators
+$pSid = Sid-Helper `
+    -pValue 'S-1-5-32-551' `
+    -Api RtlAllocateAndInitializeSid -UseApi
+Sid-Helper -pSid $pSid
+Free-IntPtr $pSid -Method Heap
+
+# S-1-5-32-555, Builtin\Remote Desktop Users
+$pSid = Sid-Helper `
+    -pValue 'S-1-5-32-555' `
+    -Api RtlAllocateAndInitializeSidEx -UseApi
+Sid-Helper -pSid $pSid
+Free-IntPtr $pSid -Method Heap
+#>
+function Sid-Helper {
+    param (
+        [Parameter(Position=0)]
+        [ValidateSet(1)]
+        [Int32]$Rev = 1,
+
+        [Parameter(Position=1)]
+        # 1=WORLD, 2=LOCAL, 5=NT Authority
+        [ValidateSet(1,2,5)]
+        [Int32]$Auth = 5,
+
+        [Parameter(Position=2)]
+        # Array of sub-authorities
+        [Int32[]]$Subs = $null,
+
+        [Parameter(Position=3)]
+        # S-1-5-32-558 etc
+        [string]$pValue = $null,
+
+        [Parameter(Position=4)]
+        [ValidateSet("RtlInitializeSid", "RtlInitializeSidEx", "RtlAllocateAndInitializeSid", "RtlAllocateAndInitializeSidEx")]
+        [string]$Api = 'RtlInitializeSid',
+
+        [Parameter(Position=5)]
+        # Parse pSid
+        [IntPtr]$pSid = [IntPtr]::Zero,
+
+        [Parameter(Position=6)]
+        [Switch]$UseApi
+    )
+
+    if ($pSid -ne [IntPtr]::Zero) {
+        try {
+            $parsedRev = [Marshal]::ReadByte($pSid, 0x00) 
+            $parsedCount = [Marshal]::ReadByte($pSid, 0x01) 
+            $parsedAuth = [Marshal]::ReadByte($pSid, 0x07) 
+            
+            $parsedSubs = @()
+            for ($i = 0; $i -lt $parsedCount; $i++) {
+                $subAuthority = [Marshal]::ReadInt32($pSid, 0x08 + (0x04 * $i))
+                $parsedSubs += $subAuthority
+            }
+            $sidString = (
+                "S-$parsedRev-$parsedAuth-{0}" -f ($parsedSubs -join "-")
+            )
+            return $sidString
+        } catch {
+            return $null
+        }
+    }
+
+    if (-not [string]::IsNullOrEmpty($pValue)) {
+        if ($pValue -notmatch '^S-\d+-\d+(-\d+)*$') {
+            return $null
+        }
+        $sidParts = $pValue.Split('-')[1..99]
+        try {
+            $Rev = [Int32]$sidParts[0]
+            $Auth = [Int32]$sidParts[1]
+            $Subs = $sidParts[2..99] | ForEach-Object { [Int32]$_ }
+
+        } catch {
+            return $null
+        }
+    }
+
+    if (-not $Subs -or $Subs.Count -le 0) {
+        return $null
+    }
+
+    $Count = $Subs.Count
+    $SidSize = 8 + (4 * $Count)
+
+    if ($UseApi) {
+
+        # ~~~ RtlInitializeSid ~~~
+        if ($Api -eq 'RtlInitializeSid') {
+            
+            $Count = [Byte]($Subs.Count)
+            $pSid = New-IntPtr -Size (8 + (4*($Subs.Count)))
+            $AuthPtr = New-IntPtr -Data ([Byte[]](0,0,0,0,0,$Auth))
+
+            $ret = Invoke-UnmanagedMethod `
+                -Dll Ntdll.dll `
+                -Function RtlInitializeSid `
+                -Values @($pSid, $AuthPtr, $Count)
+
+            Free-IntPtr -handle $AuthPtr
+            if ($ret -eq 0x00) {
+                [Marshal]::Copy(
+                    ($Subs | ForEach-Object { [BitConverter]::GetBytes($_) }), 0x00,
+                    (Invoke-UnmanagedMethod Ntdll.dll RtlSubAuthoritySid intptr -Values @($pSid, 0x00)),
+                    ($Subs.Count * 0x04)
+                )
+                return $pSid
+            }
+            Free-IntPtr $pSid
+            return $null
+        }
+
+        # ~~~ RtlInitializeSidEx ~~~
+        if ($Api -eq 'RtlInitializeSidEx') {
+            
+            $Count = [Byte]($Subs.Count)
+            $pSid = New-IntPtr -Size (8 + (4*($Subs.Count)))
+            $AuthPtr = New-IntPtr -Data ([Byte[]](0,0,0,0,0,$Auth))
+
+            $val_1 = if ($Count -ge 1) { $Subs[0] } else { 0 }
+            $val_2 = if ($Count -ge 2) { $Subs[1] } else { 0 }
+            $val_3 = if ($Count -ge 3) { $Subs[2] } else { 0 }
+            $val_4 = if ($Count -ge 4) { $Subs[3] } else { 0 }
+            $val_5 = if ($Count -ge 5) { $Subs[4] } else { 0 }
+            $val_6 = if ($Count -ge 6) { $Subs[5] } else { 0 }
+            $val_7 = if ($Count -ge 7) { $Subs[6] } else { 0 }
+            $val_8 = if ($Count -ge 8) { $Subs[7] } else { 0 }
+
+            $ret = Invoke-UnmanagedMethod `
+                -Dll Ntdll.dll `
+                -Function RtlInitializeSidEx `
+                -Values @(
+                    $pSid, $AuthPtr, $Count,
+                    $val_1,$val_2,$val_3,$val_4,   # a3: SubAuthority, no limit here
+                    $val_5,$val_6,$val_7,$val_8    # a3: As long value > 0, it work
+                )
+
+            Free-IntPtr -handle $AuthPtr
+            if ($ret -eq 0x00) {
+                return $pSid
+            }
+            Free-IntPtr $pSid
+            return $null
+        }
+      
+        # ~~~ RtlAllocateAndInitializeSidEx ~~~
+        if ($Api -eq 'RtlAllocateAndInitializeSid') {
+            
+            $pSidByRef = New-IntPtr -Size ([IntPtr]::Size)
+            $AuthPtr = New-IntPtr -Data ([Byte[]](0,0,0,0,0,$Auth))
+
+            $val_1 = if ($Count -ge 1) { $Subs[0] } else { 0 }
+            $val_2 = if ($Count -ge 2) { $Subs[1] } else { 0 }
+            $val_3 = if ($Count -ge 3) { $Subs[2] } else { 0 }
+            $val_4 = if ($Count -ge 4) { $Subs[3] } else { 0 }
+            $val_5 = if ($Count -ge 5) { $Subs[4] } else { 0 }
+            $val_6 = if ($Count -ge 6) { $Subs[5] } else { 0 }
+            $val_7 = if ($Count -ge 7) { $Subs[6] } else { 0 }
+            $val_8 = if ($Count -ge 8) { $Subs[7] } else { 0 }
+
+            $ret = Invoke-UnmanagedMethod `
+                -Dll Ntdll.dll `
+                -Function RtlAllocateAndInitializeSid `
+                -Values @(
+                    $AuthPtr,   # a1: Pointer to the 6-byte Identifier Authority
+                    $Count,     # a2: SubAuthority Count
+$val_1,$val_2,$val_3,$val_4,    # a3: SubAuthority 0..3
+$val_5,$val_6,$val_7,$val_8,    # a3: SubAuthority 4..7
+                    $pSidByRef  # a4: Output pointer for the new SID
+                )
+
+            $pSid = [IntPtr]::Zero
+            if ($ret -eq 0x00) {
+                $pSid = [Marshal]::ReadIntPtr($pSidByRef)
+            }
+            Free-IntPtr -handle $AuthPtr
+            Free-IntPtr -handle $pSidByRef
+            if ($ret -eq 0x00) {
+                return $pSid
+            }
+            return $null
+        }
+
+        # ~~~ RtlAllocateAndInitializeSidEx ~~~
+        if ($Api -eq 'RtlAllocateAndInitializeSidEx') {
+
+            $pSidByRef = New-IntPtr -Size ([IntPtr]::Size)
+            $AuthPtr = New-IntPtr -Data ([Byte[]](0,0,0,0,0,$Auth))
+            $SubsPtr = New-IntPtr -Data ($Subs | ForEach-Object { [BitConverter]::GetBytes($_) })
+
+            $ret = Invoke-UnmanagedMethod `
+                -Dll Ntdll.dll `
+                -Function RtlAllocateAndInitializeSidEx `
+                -Values @(
+                    $AuthPtr,   # a1: Pointer to the 6-byte Identifier Authority
+                    $Count,     # a2: SubAuthority Count
+                    $SubsPtr,   # a3: Pointer to the array of RIDs
+                    $pSidByRef  # a4: Output pointer for the new SID
+                )
+
+            $pSid = [IntPtr]::Zero
+            if ($ret -eq 0x00) {
+                $pSid = [Marshal]::ReadIntPtr($pSidByRef)
+            }
+            Free-IntPtr -handle $AuthPtr
+            Free-IntPtr -handle $SubsPtr
+            Free-IntPtr -handle $pSidByRef
+            if ($ret -eq 0x00) {
+                return $pSid
+            }
+            return $null
+        }
+
+        return $null
+    }
+
+    try {
+        $pSid = New-IntPtr -Size $SidSize
+        @($Rev, $Count, 0,0,0,0,0, $Auth) | ForEach `
+            -Begin { $i = 0 } `
+            -Process { [Marshal]::WriteByte($pSid, $i++, $_)  }
+        for ($i = 0; $i -lt $Subs.Length; $i++) {
+            [Marshal]::WriteInt32($pSid, 0x08 + (0x04 * $i), $Subs[$i])
+        }
+        return $pSid
+    }
+    catch {
+        Free-IntPtr $pSid
+        return $null
     }
 }
 
@@ -5065,9 +5334,9 @@ function New-ComInterface {
     )).DefineDynamicModule($InterfaceName, $false)
 
     $ICom = $Module.DefineType($InterfaceName, 'Public, Interface, Abstract, Import')
-    $ICom.SetCustomAttribute($CAB::new([System.Runtime.InteropServices.ComImportAttribute].GetConstructor(@()), @()))
-    $ICom.SetCustomAttribute($CAB::new([System.Runtime.InteropServices.GuidAttribute].GetConstructor(@([String])), @($IID)))
-    $ICom.SetCustomAttribute($CAB::new([System.Runtime.InteropServices.InterfaceTypeAttribute].GetConstructor(@([Int16])), @([Int16]1)))
+    $ICom.SetCustomAttribute($CAB::new([ComImportAttribute].GetConstructor(@()), @()))
+    $ICom.SetCustomAttribute($CAB::new([GuidAttribute].GetConstructor(@([String])), @($IID)))
+    $ICom.SetCustomAttribute($CAB::new([InterfaceTypeAttribute].GetConstructor(@([Int16])), @([Int16]1)))
     foreach ($Field in $Fields) {
         if (!($Field.ContainsKey('Name'))) {
             Write-error "Fields contain bad parameters .!"
@@ -5118,7 +5387,7 @@ function Invoke-ComInterface {
     }
     finally {
         if ($Release) {
-            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObject.Instance) | Out-Null
+            [Marshal]::ReleaseComObject($ComObject.Instance) | Out-Null
         }
     }
 }
@@ -9639,7 +9908,7 @@ public static class TEB
     public static bool IsRobustValidx64Stub(IntPtr funcAddress)
     {
         byte[] buffer = new byte[30];
-        System.Runtime.InteropServices.Marshal.Copy(funcAddress, buffer, 0, 30);
+        Marshal.Copy(funcAddress, buffer, 0, 30);
 
         // Look for the "mov r10, rcx" pattern
         int movR10RcxIndex = -1;
@@ -11422,7 +11691,7 @@ Function Lsa-LogonUser {
 
             Write-Host "`n[originName]" -ForegroundColor Yellow
             $originBufferPtr = [Marshal]::ReadIntPtr($originName, [IntPtr]::Size)  # Offset to Buffer field
-            $originNameStr = [System.Runtime.InteropServices.Marshal]::PtrToStringAnsi($originBufferPtr)
+            $originNameStr = [Marshal]::PtrToStringAnsi($originBufferPtr)
             Write-Host "Pointer: $originName"
             Write-Host "Buffer: $originBufferPtr"
             Write-Host "Value: $originNameStr"
@@ -11432,9 +11701,9 @@ Function Lsa-LogonUser {
 
             Write-Host "`n[Token Source]" -ForegroundColor Yellow
             $sourceBytes = New-Object byte[] 8
-            [System.Runtime.InteropServices.Marshal]::Copy($tokenSource, $sourceBytes, 0, 8)
+            [Marshal]::Copy($tokenSource, $sourceBytes, 0, 8)
             $sourceNameStr = [System.Text.Encoding]::ASCII.GetString($sourceBytes)
-            $luid = [System.Runtime.InteropServices.Marshal]::ReadInt64($tokenSource, 8)
+            $luid = [Marshal]::ReadInt64($tokenSource, 8)
             Write-Host "Ptr: $tokenSource"
             Write-Host "Name: $sourceNameStr"
             Write-Host "LUID: $luid"
@@ -11733,9 +12002,15 @@ catch {
             $Token::SetProcessWindowStation($WinstaOld) | Out-Null
         }
 
-        ## Call helper DLL
-        if (!(Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function GetLogonSidFromToken -Return bool -Values @($hToken, ([ref]$LogonSid)))) {
-            throw "GetLogonSidFromToken helper failed .!"
+        if (([PSTypeName]'NtCoreLib.NtToken').Type) {
+            ## Use NT Object Manger Libary
+            $logonInfo = Get-NtTokenSid -Token ([NtCoreLib.NtToken]::FromHandle($hToken)) -LogonId
+            $LogonSid = New-IntPtr -Data ($logonInfo.ToArray())
+        } else {
+            ## Call helper DLL
+            if (!(Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function GetLogonSidFromToken -Return bool -Values @($hToken, ([ref]$LogonSid)))) {
+                throw "GetLogonSidFromToken helper failed .!"
+            }
         }
 
         ## Call helper DLL
@@ -12367,6 +12642,10 @@ Function Invoke-ProcessAsUser {
 
     @ Starting an Interactive Client Process in C++
     # https://learn.microsoft.com/en-us/previous-versions//aa379608(v=vs.85)?redirectedfrom=MSDN
+
+    @ Window Stations and Desktops 6
+    @ Starting an Interactive Client Process in C++ Working Win32 program example
+    # https://www.installsetupconfig.com/win32programming/windowstationsdesktops13_5.html
 
     @ CreateProcessAsUser example
     # https://github.com/msmania/logue/blob/master/logue.cpp
@@ -30601,6 +30880,7 @@ if (-not (Get-Module PSWriteHTML -ListAvailable)) {
   throw "ERROR: Missing libary - PSWriteHTML"
   return
 }
+Import-Module PSWriteHTML -ErrorAction Stop
 
 $tempPath = "$env:windir\Temp" #[Path]::GetTempPath()
 $currentScriptLocation = $PSScriptRoot
