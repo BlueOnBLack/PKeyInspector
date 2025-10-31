@@ -11967,7 +11967,7 @@ Function Process-UserToken {
     }
     #>
 
-    $NtCoreLib = [Bool]$UseCurrent.IsPresent -and [Bool]([PSTypeName]'NtCoreLib.NtToken').Type -and ($Mode -ne [VistaMode]::Api)
+    $NtCoreLib = ($Mode -ne [VistaMode]::Api) -and [Bool]([PSTypeName]'NtCoreLib.NtToken').Type
     if (-not $NtCoreLib) {
         if (-not ([Io.file]::Exists("c:\temp\dacl.dll"))) {
             try {
@@ -12022,28 +12022,64 @@ Function Process-UserToken {
     }
 
     if ($Params -ne $null) {
-        if (!$UseCurrent) {
-            Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hWinSta, $Params.LogonSid)  | Out-Null
-            Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hDesktop, $Params.LogonSid) | Out-Null
-        }
         
+        if (!$UseCurrent) {
+            if ($NtCoreLib) {
+            
+                # Nothing here, keep it.
+
+            } else {
+
+                Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hWinSta, $Params.LogonSid)  | Out-Null
+                Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hDesktop, $Params.LogonSid) | Out-Null
+                Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @(([IntPtr]-1), $Params.LogonSid) | Out-Null
+            }
+        }
+
         Free-IntPtr -handle $Params.hToken    -Method NtHandle
         Free-IntPtr -handle $Params.LogonSid  -Method NtHandle
 
         if (!$UseCurrent) {
-            Free-IntPtr -handle ($Params.hDesktop) -Method Desktop
-            Free-IntPtr -handle ($Params.hWinSta)  -Method WindowStation
+            if ($NtCoreLib) {
+                ($Params.hDesktop).Dispose()
+                ($Params.hWinSta).Dispose()
+            } else {
+                Free-IntPtr -handle ($Params.hDesktop) -Method Desktop
+                Free-IntPtr -handle ($Params.hWinSta)  -Method WindowStation
+            }
         }
     }
     elseif ($hToken -ne [IntPtr]::Zero) {
         $nullPtr = [IntPtr]::Zero
-        $hDesktop, $hWinSta = $nullPtr, $nullPtr
-        $activeSessionIdPtr, $LogonSid = $nullPtr, $nullPtr
+        $hDesktop, $hWinSta = $null, $null
+        $activeSessionIdPtr, $LogonSid = $null, $null
 
         if ($NtCoreLib) {
-            $hProc = Get-NtProcess -Current -Access MaximumAllowed
-            $hDesktop = Get-NtDesktop -Current -Access MaximumAllowed
-            $hWinSta = Get-NtWindowStation -Current -Access MaximumAllowed
+            if ($UseCurrent) {
+                $hProc = Get-NtProcess -Current -Access MaximumAllowed
+                $hDesktop = Get-NtDesktop -Current -Access MaximumAllowed
+                $hWinSta = Get-NtWindowStation -Current -Access MaximumAllowed
+
+           # ~~~~~~~ $
+            } else {
+           # ~~~~~~~ $
+
+                $hProc = Get-NtProcess -Current -Access MaximumAllowed
+                $SessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+                $WinStaPath = "\Sessions\$SessionId\Windows\WindowStations\WinSta0"
+                $WinStaAccess = [NtCoreLib.Security.Authorization.AccessMask]::new(0x00020000 -bor 0x00040000)
+                $hWinSta = [NtCoreLib.NtWindowStation]::OpenWithType(
+                    "WindowStation", $WinStaPath, $null, $WinStaAccess)
+
+                if (-not $hWinSta) {
+                    throw "Failed to open WinSta0. Check permissions or path."
+                }
+
+                $DesktopPath = "Default"
+                $DesktopAccess = [NtCoreLib.Security.Authorization.AccessMask]::new(0x00020000 -bor 0x00040000 -bor 0x0080 -bor 0x0001)
+                $hDesktop = [NtCoreLib.NtDesktop]::OpenWithType(
+                    "Desktop", $DesktopPath, $hWinSta, $DesktopAccess)
+            }
         }
         elseif ($UseCurrent) {
             $hWinSta = $Token::GetProcessWindowStation()
@@ -12101,7 +12137,9 @@ Function Process-UserToken {
             $hWinSta.SetSecurityDescriptor($SecurityDescriptor, 'Dacl', $true)
 
         }  else {
-
+            
+            $LogonSid = [IntPtr]::Zero
+            
             ## Call helper DLL
             if (!(Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function GetLogonSidFromToken -Return bool -Values @($hToken, ([ref]$LogonSid)))) {
                 throw "GetLogonSidFromToken helper failed .!"
@@ -12491,18 +12529,22 @@ Invoke-ProcessAsUser `
 # User [Case], see less error's
 $AuthMode = [AuthenticationMode]::User
 
+<#
 Invoke-ProcessAsUser `
     -Application 'conhost.exe' `
     -UserName Administrator `
     -Password 0444 `
     -Mode $AuthMode `
-    -RunAsConsole
+    -VistaMode DotNet `
+    -RunAsConsole `
+    -SetVistaFlag -SetNewVista
 
 Invoke-ProcessAsUser `
     -Application 'cmd.exe' `
     -UserName Administrator `
     -Password 0444 `
     -Mode $AuthMode `
+    -VistaMode DotNet `
     -RunAsConsole `
     -SetVistaFlag -SetNewVista
 
@@ -12511,7 +12553,37 @@ Invoke-ProcessAsUser `
     -UserName Administrator `
     -Password 0444 `
     -Mode $AuthMode `
+    -VistaMode DotNet `
+    -RunAsConsole `
+    -SetVistaFlag -SetNewVista
+#>
+
+<#
+Invoke-ProcessAsUser `
+    -Application 'conhost.exe' `
+    -UserName Administrator `
+    -Password 0444 `
+    -Mode $AuthMode `
+    -VistaMode Api `
+    -RunAsConsole
+
+Invoke-ProcessAsUser `
+    -Application 'cmd.exe' `
+    -UserName Administrator `
+    -Password 0444 `
+    -Mode $AuthMode `
+    -VistaMode Api `
+    -RunAsConsole `
+    -SetVistaFlag -SetNewVista
+
+Invoke-ProcessAsUser `
+    -Application 'notepad.exe' `
+    -UserName Administrator `
+    -Password 0444 `
+    -Mode $AuthMode `
+    -VistaMode Api `
     -SetVistaFlag
+#>
 #>
 Function Invoke-Process {
     Param (
@@ -12895,9 +12967,9 @@ Function Invoke-ProcessAsUser {
 
             # Clean Params laters
             if ($SetNewVista) {
-                Process-UserToken -Params $hInfo
+                Process-UserToken -Params $hInfo -Mode $VistaMode
             } else {
-                Process-UserToken -Params $hInfo -UseCurrent
+                Process-UserToken -Params $hInfo -Mode $VistaMode -UseCurrent
             }
 
             ####################
@@ -12945,9 +13017,9 @@ Function Invoke-ProcessAsUser {
 
             # Clean Params laters
             if ($SetNewVista) {
-                Process-UserToken -Params $hInfo
+                Process-UserToken -Params $hInfo -Mode $VistaMode
             } else {
-                Process-UserToken -Params $hInfo -UseCurrent
+                Process-UserToken -Params $hInfo -Mode $VistaMode -UseCurrent
             }
 
         } elseif ($Mode -eq 0x02) {
@@ -12989,9 +13061,9 @@ Function Invoke-ProcessAsUser {
 
             # Clean Params laters
             if ($SetNewVista) {
-                Process-UserToken -Params $hInfo
+                Process-UserToken -Params $hInfo -Mode $VistaMode
             } else {
-                Process-UserToken -Params $hInfo -UseCurrent
+                Process-UserToken -Params $hInfo -Mode $VistaMode -UseCurrent
             }
         }
 
