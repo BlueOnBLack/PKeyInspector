@@ -12123,7 +12123,6 @@ Function Process-UserToken {
             
             Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @([IntPtr]-1, $Params.LogonSid) | Out-Null
             Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @([IntPtr]$Params.hDesktop, $Params.LogonSid) | Out-Null
-            
               
             ## keep it for stability. from Prev .Net test's, 
             ## kill both Acc->Allowed Rules, would kill the window
