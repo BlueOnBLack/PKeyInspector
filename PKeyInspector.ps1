@@ -11386,8 +11386,8 @@ Add-Type $tokenHelperCode -Language CSharp -ErrorAction Stop
 }
 enum VistaMode {
     Auto   = 0
-    DotNet = 0
-    Api    = 1
+    DotNet = 1
+    Api    = 2
 }
 enum SERVICE_STATUS {
     STOPPED = 0x00000001
@@ -11934,8 +11934,80 @@ Function Process-UserToken {
         [PSObject]$Params = $null,
         [IntPtr]$hToken = [IntPtr]::Zero,
         [VistaMode]$Mode = [VistaMode]::Auto,
-        [switch]$UseCurrent
+        [switch]$UseCurrent,
+        [bool]$RemoveAce = $False
     )
+
+    <#
+    .MODES (Most Stable - Explicit ACE Grant)
+    * **$UseCurrent (Switch Parameter)**
+    // Retrieves the currently associated WINSTA handle.
+    // Highly Stable. Access relies on native rights + the explicit WINSTA ACE.
+    // REQUIRES: Must keep the WINSTA ACE.
+
+    * **[VistaMode]::Api (Original C Way)**
+        // Uses Low level Api & Also called SetProcessWindowStation
+        // REQUIRES: Must keep the WINSTA ACE.
+
+    * **[VistaMode]::DotNet**
+        // Explicitly opens the target WINSTA handle (no SetProcessWindowStation).
+        // Highly Stable. Access relies entirely on the explicit WINSTA ACE.
+        // REQUIRES: Must keep the WINSTA ACE.
+    #>
+
+    Function Remove-AceFromObject {
+        param (
+            [object[]]$NtObject,
+            $targetSid,
+            [switch]$First,
+            [switch]$Log
+        )
+
+        foreach ($obj in $NtObject) {
+
+            $aceRemoved = $false
+            $SecurityDescriptor = $obj | Get-NtSecurityDescriptor
+            $i = 0
+            $Max = $SecurityDescriptor.Dacl.Count
+
+            $idxArray = @()
+            while ($i -ne $Max) {
+                $currentAce = $SecurityDescriptor.Dacl[$i]
+                if ($currentAce.Sid.ToString() -eq $targetSid) {
+                    if ($currentAce.Type -eq 'Allowed') {
+                        $idxArray += $i
+                    }
+                }
+                $i++
+            }
+
+            $OffsetFix = 1;
+            foreach ($idx in $idxArray) {
+                $aceRemoved = $true
+                $Index = $idx + --$OffsetFix;
+                $currentAce = $SecurityDescriptor.Dacl[$Index]
+                $SecurityDescriptor.Dacl.RemoveAt($Index)
+                if ($log) {
+                  Write-host ("Removed Object {0} At Index {1} in DACL Of {2}, Value of {3}" -f $currentAce.Sid.ToString(), $Index, $obj.GetType().Name, $targetSid) -ForegroundColor Green
+                }
+                if ($First) {
+                    break;
+                }
+            }
+
+            if ($aceRemoved) {
+                $obj.SetSecurityDescriptor($SecurityDescriptor, 'Dacl', $true) | Out-Null
+                if ($log) {
+                  Write-host ("Successfully updated DACL of {0}" -f $obj.GetType().Name) -ForegroundColor Cyan
+                }
+            }
+            else {
+                if ($log) {
+                  Write-Host ("No matching ACE found in DACL of {0} for SID {1}" -f $obj.GetType().Name, $targetSid) -ForegroundColor Red
+                }
+            }
+        }
+    }
 
     <#
     try {
@@ -11972,8 +12044,11 @@ Function Process-UserToken {
     }
     #>
 
-    $NtCoreLib = ($Mode -ne [VistaMode]::Api) -and [Bool]([PSTypeName]'NtCoreLib.NtToken').Type
-    if (-not $NtCoreLib) {
+    $DotNetMode = $Mode -ne [VistaMode]::Api
+    $NtCoreLib = [Bool]([PSTypeName]'NtCoreLib.NtToken').Type
+    $UseDotNet = $DotNetMode -and $NtCoreLib
+    
+    if (!$UseDotNet) {
         if (-not ([Io.file]::Exists("c:\temp\dacl.dll"))) {
             try {
                 $base64String = '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'
@@ -12028,16 +12103,41 @@ Function Process-UserToken {
 
     if ($Params -ne $null) {
         
-        if (!$UseCurrent) {
-            if ($NtCoreLib) {
+        if ($UseDotNet) {    
             
-                # Nothing here, keep it.
+            ## Run this in New Object / current objects, safe, will not kill the window
+            ## Using .net libary < NtObjectManager >, more safe to use
+            ## https://www.powershellgallery.com/packages/NtObjectManager
+            ## https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
 
-            } else {
+            $NtObject = ($Params.hProc, $Params.hDesktop) #, $Params.hWinSta)
+            $logonInfo = Get-NtTokenSid -Token ([NtCoreLib.NtToken]::FromHandle($Params.hToken)) -LogonId
+            Remove-AceFromObject $NtObject $logonInfo.ToString()
 
-                Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hWinSta, $Params.LogonSid)  | Out-Null
-                Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @($Params.hDesktop, $Params.LogonSid) | Out-Null
-                Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @(([IntPtr]-1), $Params.LogonSid) | Out-Null
+            ## Not safe, unlike C Origional concept, i dont call SetProcessWindowStation
+            ## And Also, after trial & Test, remove [1] Ace of [Both], will keep it alive
+            ## Remove Both, window is dead. immediately. !! no talking. Dead. !.!
+            ## But Remove with -First is safe. [left 1 ace Allowed]
+            if ($RemoveAce) {
+              Remove-AceFromObject $Params.hWinSta $logonInfo.ToString() #-First
+            }
+       
+       # !!!!!!!!!!!!!!!!!!!!!!!!!! ~ @
+        } else {
+       # !!!!!!!!!!!!!!!!!!!!!!!!!! ~ @
+            
+            Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @([IntPtr]-1, $Params.LogonSid) | Out-Null
+            Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @([IntPtr]$Params.hDesktop, $Params.LogonSid) | Out-Null
+            
+              
+            ## keep it for stability. from Prev .Net test's, 
+            ## kill both Acc->Allowed Rules, would kill the window
+            ## it our case, we also use SetProcessWindowStation, 
+            ## which proabbly save Us from same Future
+            
+            # Run this only in New Object, other, it kill the window
+            if (-not $UseCurrent -and $RemoveAce) { 
+              Invoke-UnmanagedMethod -Dll "C:\temp\dacl.dll" -Function RemoveAccessAllowedAcesBasedSID -Return bool -Values @([IntPtr]$Params.hWinSta, $Params.LogonSid)  | Out-Null
             }
         }
 
@@ -12045,7 +12145,7 @@ Function Process-UserToken {
         Free-IntPtr -handle $Params.LogonSid  -Method NtHandle
 
         if (!$UseCurrent) {
-            if ($NtCoreLib) {
+            if ($UseDotNet) {
                 ($Params.hDesktop).Dispose()
                 ($Params.hWinSta).Dispose()
             } else {
@@ -12059,7 +12159,7 @@ Function Process-UserToken {
         $hDesktop, $hWinSta = $null, $null
         $activeSessionIdPtr, $LogonSid = $null, $null
 
-        if ($NtCoreLib) {
+        if ($UseDotNet) {
             if ($UseCurrent) {
                 $hProc = Get-NtProcess -Current -Access MaximumAllowed
                 $hDesktop = Get-NtDesktop -Current -Access MaximumAllowed
@@ -12108,7 +12208,7 @@ Function Process-UserToken {
             $Token::SetProcessWindowStation($hwinstaSave) | Out-Null
         }
 
-        if ($NtCoreLib) {
+        if ($UseDotNet) {
             $logonInfo = Get-NtTokenSid -Token ([NtCoreLib.NtToken]::FromHandle($hToken)) -LogonId
             $LogonSid = New-IntPtr -Data ($logonInfo.ToArray())
             # ~~~~~~~~~~~~
@@ -12183,6 +12283,7 @@ Function Process-UserToken {
            hDesktop = $hDesktop
            LogonSid = $LogonSid
            hToken   = $hToken
+           hProc    = $hProc
         }
     }
 }
@@ -12506,33 +12607,48 @@ Invoke-Process `
     -RunAsConsole `
     -UseDuplicatedToken
 
-# Logon Mode, work from Any Account * Admin, Normal, etc
-# but could fail using System Prev Process
+Clear-Host
+Write-Host
 
-Invoke-ProcessAsUser `
-    -Application 'conhost.exe' `
-    -UserName 'Any_USER' `
-    -Password 'Password' `
-    -Mode Logon `
-    -RunAsConsole
-
-# Work only using Low Prev Acc to High Prev Acc, Or same Level,
-# But Not from High to Low, will fail
-
+# Mode Token / User
+# Req` System Prev, And Also User/Pass Of High Prev Acc
+# Interactive Window will be avilible even on Normal User
+# Can be used with --> -VistaMode // DotNet, Api, Auto
+# Can be used with --> -SetVistaFlag -SetNewVista
+# can be used with --> -RemoveVistaAce, Only for cmd.exe // Aka Terminal
 Invoke-ProcessAsUser `
     -Application 'conhost.exe' `
     -UserName Administrator `
     -Password 0444 `
-    -Mode Hybrid `
+    -Mode Token `
+    -RunAsConsole `
+    -VistaMode DotNet `
+    -SetVistaFlag -SetNewVista
+
+# Can be used with Any User
+# VistaMode Not Applied to this Case !
+# Do not Set Flags Of 
+# -SetVistaFlag -SetNewVista -RemoveVistaAce
+Invoke-ProcessAsUser `
+    -Application 'cmd.exe' `
+    -CommandLine '/k whoami' `
+    -UserName 'Any_User' `
+    -Password 'Password' `
+    -Mode Logon `
     -RunAsConsole
 
-# RunAs Token / User
-# Will work even with Normal limited Acc,
-# As long, as it run from Priv Process, And Priv Acc Info
-
-# User [Case] Or Token [Case]
-# User [Case], see less error's
-$AuthMode = [AuthenticationMode]::User
+# Logon+ Mode
+# Can be used with High Priv Acc Only
+# Low/High Pri Acc call high Priv Acc
+# Can be used with --> -VistaMode // DotNet, Api, Auto
+# Can be used with --> -SetVistaFlag -SetNewVista
+# can be used with --> -RemoveVistaAce, Only for cmd.exe // Aka Terminal
+Invoke-ProcessAsUser `
+    -Application 'notepad.exe' `
+    -UserName Administrator `
+    -Password 0444 `
+    -VistaMode Auto `
+    -Mode Hybrid
 
 <#
 Invoke-ProcessAsUser `
@@ -12812,7 +12928,10 @@ Function Invoke-ProcessAsUser {
         [switch] $SetVistaFlag,
 
         [Parameter(Mandatory=$false)]
-        [switch] $SetNewVista
+        [switch] $SetNewVista,
+
+        [Parameter(Mandatory=$false)]
+        [switch] $RemoveVistaAce
     )
 
     <#
@@ -12950,7 +13069,7 @@ Function Invoke-ProcessAsUser {
 
             # Prefere hToken for current User
             if ($SetNewVista) {
-                $hInfo = Process-UserToken -hToken $hToken -Mode $VistaMode
+                $hInfo = Process-UserToken -hToken $hToken -Mode $VistaMode 
             } else {
                 $hInfo = Process-UserToken -hToken $hToken -Mode $VistaMode -UseCurrent
             }
@@ -12972,9 +13091,9 @@ Function Invoke-ProcessAsUser {
 
             # Clean Params laters
             if ($SetNewVista) {
-                Process-UserToken -Params $hInfo -Mode $VistaMode
+                Process-UserToken -Params $hInfo -Mode $VistaMode -RemoveAce $RemoveVistaAce.IsPresent
             } else {
-                Process-UserToken -Params $hInfo -Mode $VistaMode -UseCurrent
+                Process-UserToken -Params $hInfo -Mode $VistaMode -RemoveAce $RemoveVistaAce.IsPresent -UseCurrent
             }
 
             ####################
@@ -13022,9 +13141,9 @@ Function Invoke-ProcessAsUser {
 
             # Clean Params laters
             if ($SetNewVista) {
-                Process-UserToken -Params $hInfo -Mode $VistaMode
+                Process-UserToken -Params $hInfo -Mode $VistaMode -RemoveAce $RemoveVistaAce.IsPresent
             } else {
-                Process-UserToken -Params $hInfo -Mode $VistaMode -UseCurrent
+                Process-UserToken -Params $hInfo -Mode $VistaMode -RemoveAce $RemoveVistaAce.IsPresent -UseCurrent
             }
 
         } elseif ($Mode -eq 0x02) {
@@ -13066,9 +13185,9 @@ Function Invoke-ProcessAsUser {
 
             # Clean Params laters
             if ($SetNewVista) {
-                Process-UserToken -Params $hInfo -Mode $VistaMode
+                Process-UserToken -Params $hInfo -Mode $VistaMode -RemoveAce $RemoveVistaAce.IsPresent
             } else {
-                Process-UserToken -Params $hInfo -Mode $VistaMode -UseCurrent
+                Process-UserToken -Params $hInfo -Mode $VistaMode -RemoveAce $RemoveVistaAce.IsPresent -UseCurrent
             }
         }
 
